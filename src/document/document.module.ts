@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { MongooseModule } from '@nestjs/mongoose';
 import { TypeOrmModule } from '@nestjs/typeorm';
+import { StorageModule } from '../storage/storage.module.js';
 import { DocumentController } from './document.controller.js';
 import { DocumentService } from './document.service.js';
 import { Document } from './entities/document.entity.js';
@@ -30,6 +31,7 @@ const mongoUri =
       synchronize: false,
     }),
     TypeOrmModule.forFeature([Document]),
+    StorageModule,
   ],
   controllers: [DocumentController],
   providers: [DocumentService],

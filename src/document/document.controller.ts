@@ -6,10 +6,15 @@ import {
   Param,
   Patch,
   Post,
+  UploadedFile,
+  UseInterceptors,
 } from '@nestjs/common';
+import { FileInterceptor } from '@nestjs/platform-express';
+import type { SourceFile } from '../storage/rustfs.service.js';
 import { DocumentService } from './document.service.js';
 import { CreateDocumentDto } from './dto/create-document.dto.js';
 import { DeleteDocumentDto } from './dto/delete-document.dto.js';
+import { ParseUploadDto } from './dto/parse-upload.dto.js';
 import { UpdateDocumentDto } from './dto/update-document.dto.js';
 
 @Controller('documents')
@@ -19,6 +24,15 @@ export class DocumentController {
   @Post()
   create(@Body() createDocumentDto: CreateDocumentDto) {
     return this.documentService.create(createDocumentDto);
+  }
+
+  @Post('parse/upload')
+  @UseInterceptors(FileInterceptor('file'))
+  parseUpload(
+    @UploadedFile() file: SourceFile,
+    @Body() parseUploadDto: ParseUploadDto,
+  ) {
+    return this.documentService.parseUpload(file, parseUploadDto);
   }
 
   @Get()
