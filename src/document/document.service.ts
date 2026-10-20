@@ -9,7 +9,9 @@ import { Model } from 'mongoose';
 import path from 'node:path';
 import { Repository } from 'typeorm';
 import { detectParser, parseToMarkdown } from '../parser/index.js';
+import { PipelineManagerService } from '../pipelineManager/pipeline-manager.service.js';
 import { RustfsService, type SourceFile } from '../storage/rustfs.service.js';
+import { DocumentStatus } from './document-status.js';
 import { CreateDocumentDto } from './dto/create-document.dto.js';
 import { DeleteDocumentDto } from './dto/delete-document.dto.js';
 import { ParseUploadDto } from './dto/parse-upload.dto.js';
@@ -29,6 +31,7 @@ export class DocumentService {
     @InjectRepository(Document)
     private readonly documentRepository: Repository<Document>,
     private readonly rustfsService: RustfsService,
+    private readonly pipelineManagerService: PipelineManagerService,
   ) {}
 
   async create(createDocumentDto: CreateDocumentDto) {
@@ -47,6 +50,38 @@ export class DocumentService {
       isPublic: createDocumentDto.isPublic,
       createBy: createDocumentDto.createBy,
     });
+  }
+
+  async publish(documentId: string) {
+    if (!/^\d+$/.test(documentId)) {
+      throw new BadRequestException('文档 ID 无效');
+    }
+
+    const document = await this.documentRepository.findOne({
+      where: { id: BigInt(documentId), deleted: false },
+    });
+    if (!document) {
+      return { message: '文档不存在' };
+    }
+    if (document.status === DocumentStatus.PUBLISHED) {
+      return { message: '文档已发布' };
+    }
+
+    const publishedAt = new Date();
+    await this.pipelineManagerService.publishDocument({
+      documentId: document.id.toString(),
+      contentId: document.contentId,
+      title: document.title,
+      publishedAt: publishedAt.toISOString(),
+    });
+    document.status = DocumentStatus.PUBLISHED;
+    document.publishTime = publishedAt;
+    const saved = await this.documentRepository.save(document);
+
+    return {
+      message: '发布成功',
+      document: this.serializeDocument(saved),
+    };
   }
 
   async parseUpload(file: SourceFile, parseUploadDto: ParseUploadDto) {
@@ -306,6 +341,7 @@ export class DocumentService {
     const document = await this.findDocument(deleteDocumentDto.id, true);
     const contentId = document.contentId;
 
+    await this.pipelineManagerService.removeDocument(document.id.toString());
     await this.documentContentModel.deleteOne({ contentId });
     await this.documentRepository.delete({ id: document.id });
 

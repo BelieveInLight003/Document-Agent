@@ -1,6 +1,8 @@
 import { Module } from '@nestjs/common';
+import { ConfigModule, ConfigService } from '@nestjs/config';
 import { MongooseModule } from '@nestjs/mongoose';
 import { TypeOrmModule } from '@nestjs/typeorm';
+import { PipelineManagerModule } from '../pipelineManager/pipeline-manager.module.js';
 import { StorageModule } from '../storage/storage.module.js';
 import { DocumentController } from './document.controller.js';
 import { DocumentService } from './document.service.js';
@@ -10,28 +12,38 @@ import {
   DocumentContentSchema,
 } from './schema/document.content.schema.js';
 
-const mongoUri =
-  process.env.MONGODB_URI ??
+const defaultMongoUri =
   'mongodb://mongo_user:mongo_pass123@127.0.0.1:27017/knowledge_hub?authSource=admin';
 
 @Module({
   imports: [
-    MongooseModule.forRoot(mongoUri),
+    StorageModule,
+    MongooseModule.forRootAsync({
+      imports: [ConfigModule],
+      inject: [ConfigService],
+      useFactory: (config: ConfigService) => ({
+        uri: config.get<string>('MONGO_URI') ?? defaultMongoUri,
+      }),
+    }),
     MongooseModule.forFeature([
       { name: DocumentContent.name, schema: DocumentContentSchema },
     ]),
-    TypeOrmModule.forRoot({
-      type: 'postgres',
-      host: process.env.POSTGRES_HOST ?? '127.0.0.1',
-      port: Number(process.env.POSTGRES_PORT ?? 5432),
-      username: process.env.POSTGRES_USER ?? 'user',
-      password: process.env.POSTGRES_PASSWORD ?? '123456',
-      database: process.env.POSTGRES_DB ?? 'knowledge_hub',
-      autoLoadEntities: true,
-      synchronize: false,
+    TypeOrmModule.forRootAsync({
+      imports: [ConfigModule],
+      inject: [ConfigService],
+      useFactory: (config: ConfigService) => ({
+        type: 'postgres' as const,
+        host: config.get<string>('POSTGRES_HOST') ?? '127.0.0.1',
+        port: Number(config.get<string>('POSTGRES_PORT') ?? 5432),
+        username: config.get<string>('POSTGRES_USER') ?? 'user',
+        password: config.get<string>('POSTGRES_PASSWORD') ?? '123456',
+        database: config.get<string>('POSTGRES_DB') ?? 'knowledge_hub',
+        autoLoadEntities: true,
+        synchronize: false,
+      }),
     }),
     TypeOrmModule.forFeature([Document]),
-    StorageModule,
+    PipelineManagerModule,
   ],
   controllers: [DocumentController],
   providers: [DocumentService],

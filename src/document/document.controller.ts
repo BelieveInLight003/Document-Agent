@@ -15,6 +15,7 @@ import { DocumentService } from './document.service.js';
 import { CreateDocumentDto } from './dto/create-document.dto.js';
 import { DeleteDocumentDto } from './dto/delete-document.dto.js';
 import { ParseUploadDto } from './dto/parse-upload.dto.js';
+import { PublishDocumentDto } from './dto/publish-document.dto.js';
 import { UpdateDocumentDto } from './dto/update-document.dto.js';
 
 @Controller('documents')
@@ -33,6 +34,11 @@ export class DocumentController {
     @Body() parseUploadDto: ParseUploadDto,
   ) {
     return this.documentService.parseUpload(file, parseUploadDto);
+  }
+
+  @Post(':id/publish')
+  publish(@Param('id') id: string) {
+    return this.documentService.publish(id);
   }
 
   @Get()
