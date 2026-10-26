@@ -67,17 +67,31 @@ export class RabbitmqPublisher implements OnModuleInit, OnModuleDestroy {
     await this.channel.assertExchange(config.exchange, config.exchangeType, {
       durable: true,
     });
-    await this.channel.assertQueue(config.queues.published, {
-      durable: true,
-    });
-    await this.channel.bindQueue(
-      config.queues.published,
-      config.exchange,
-      config.routingKeys.published,
-    );
-    this.logger.log(
-      `已绑定队列 queue=${config.queues.published} routingKey=${config.routingKeys.published}`,
-    );
+    const bindings = [
+      {
+        queue: config.queues.published,
+        routingKey: config.routingKeys.published,
+      },
+      {
+        queue: config.queues.keyword,
+        routingKey: config.routingKeys.keyword,
+      },
+      {
+        queue: config.queues.graph,
+        routingKey: config.routingKeys.graph,
+      },
+    ];
+    for (const binding of bindings) {
+      await this.channel.assertQueue(binding.queue, { durable: true });
+      await this.channel.bindQueue(
+        binding.queue,
+        config.exchange,
+        binding.routingKey,
+      );
+      this.logger.log(
+        `已绑定队列 queue=${binding.queue} routingKey=${binding.routingKey}`,
+      );
+    }
     return this.channel;
   }
 }

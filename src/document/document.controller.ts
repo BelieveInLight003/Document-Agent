@@ -6,6 +6,7 @@ import {
   Param,
   Patch,
   Post,
+  Put,
   UploadedFile,
   UseInterceptors,
 } from '@nestjs/common';
@@ -36,7 +37,7 @@ export class DocumentController {
     return this.documentService.parseUpload(file, parseUploadDto);
   }
 
-  @Post(':id/publish')
+  @Put(':id/publish')
   publish(@Param('id') id: string) {
     return this.documentService.publish(id);
   }

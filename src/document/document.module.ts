@@ -5,8 +5,11 @@ import { TypeOrmModule } from '@nestjs/typeorm';
 import { PipelineManagerModule } from '../pipelineManager/pipeline-manager.module.js';
 import { StorageModule } from '../storage/storage.module.js';
 import { DocumentController } from './document.controller.js';
+import { DocumentReviewController } from './document-review.controller.js';
+import { DocumentReviewService } from './document-review.service.js';
 import { DocumentService } from './document.service.js';
 import { Document } from './entities/document.entity.js';
+import { DocumentReview } from './entities/document-review.entity.js';
 import {
   DocumentContent,
   DocumentContentSchema,
@@ -42,10 +45,10 @@ const defaultMongoUri =
         synchronize: false,
       }),
     }),
-    TypeOrmModule.forFeature([Document]),
+    TypeOrmModule.forFeature([Document, DocumentReview]),
     PipelineManagerModule,
   ],
-  controllers: [DocumentController],
-  providers: [DocumentService],
+  controllers: [DocumentController, DocumentReviewController],
+  providers: [DocumentService, DocumentReviewService],
 })
 export class DocumentModule {}

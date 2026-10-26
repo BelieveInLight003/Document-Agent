@@ -20,15 +20,21 @@ export class RabbitmqConsumer
 {
   private readonly logger = new Logger(RabbitmqConsumer.name);
   private channel?: Channel;
-  private handler?: MessageHandler<unknown>;
+  private readonly subscriptions: {
+    queue: string;
+    handler: MessageHandler<unknown>;
+  }[] = [];
   private listening = false;
   private starting?: Promise<void>;
   private readonly maxRetry = 3;
 
   constructor(private readonly publisher: RabbitmqPublisher) {}
 
-  register<T>(handler: MessageHandler<T>) {
-    this.handler = handler as MessageHandler<unknown>;
+  register<T>(queue: string, handler: MessageHandler<T>) {
+    this.subscriptions.push({
+      queue,
+      handler: handler as MessageHandler<unknown>,
+    });
   }
 
   async onApplicationBootstrap() {
@@ -63,28 +69,34 @@ export class RabbitmqConsumer
     if (this.listening) {
       return;
     }
-    if (!this.handler) {
+    if (this.subscriptions.length === 0) {
       this.logger.warn('还没有订阅处理函数，队列里的消息会先保留');
       return;
     }
 
-    const config = getRabbitmqConfig();
     const channel = await this.publisher.openChannel();
     this.channel = channel;
-    await channel.consume(config.queues.published, (message) => {
-      void this.handleMessage(channel, message);
-    });
+    for (const subscription of this.subscriptions) {
+      const handler = subscription.handler;
+      await channel.consume(subscription.queue, (message) => {
+        void this.handleMessage(channel, message, handler);
+      });
+      this.logger.log(`已订阅队列 queue=${subscription.queue}`);
+    }
     this.listening = true;
-    this.logger.log(`已订阅队列 queue=${config.queues.published}`);
   }
 
-  private async handleMessage(channel: Channel, message: ConsumeMessage | null) {
-    if (!message || !this.handler) {
+  private async handleMessage(
+    channel: Channel,
+    message: ConsumeMessage | null,
+    handler: MessageHandler<unknown>,
+  ) {
+    if (!message) {
       return;
     }
     try {
       const payload = JSON.parse(message.content.toString()) as unknown;
-      await this.handler(payload);
+      await handler(payload);
       channel.ack(message);
     } catch (error) {
       const detail = error instanceof Error ? error.message : '处理失败';

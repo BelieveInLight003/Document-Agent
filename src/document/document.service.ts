@@ -63,6 +63,9 @@ export class DocumentService {
     if (!document) {
       return { message: '文档不存在' };
     }
+    if (document.status === DocumentStatus.PENDING_REVIEW) {
+      return { message: '文档正在审核，不能直接发布' };
+    }
     if (document.status === DocumentStatus.PUBLISHED) {
       return { message: '文档已发布' };
     }
@@ -92,11 +95,11 @@ export class DocumentService {
     const parser = detectParser(file.originalname || '');
     if (!parser) {
       throw new BadRequestException(
-        '仅支持 doc、docx、xml、ppt、pptx、txt、xls、xlsx',
+        '仅支持 doc、docx、xml、ppt、pptx、txt、xls、xlsx、pdf',
       );
     }
 
-    const markdown = parseToMarkdown(parser, file.buffer).trim();
+    const markdown = (await parseToMarkdown(parser, file.buffer)).trim();
     if (!markdown) {
       throw new BadRequestException('文件内容为空');
     }

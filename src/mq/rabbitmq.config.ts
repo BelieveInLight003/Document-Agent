@@ -16,10 +16,18 @@ export function getRabbitmqConfig() {
       published:
         process.env.RABBITMQ_QUEUE_PUBLISHED ??
         'knowledge_hub.document.published',
+      keyword:
+        process.env.RABBITMQ_QUEUE_KEYWORD ??
+        'knowledge_hub.document.keyword',
+      graph:
+        process.env.RABBITMQ_QUEUE_GRAPH ?? 'knowledge_hub.document.graph',
     },
     routingKeys: {
       published:
         process.env.RABBITMQ_ROUTING_KEY_PUBLISHED ?? 'document.published',
+      keyword:
+        process.env.RABBITMQ_ROUTING_KEY_KEYWORD ?? 'document.keyword',
+      graph: process.env.RABBITMQ_ROUTING_KEY_GRAPH ?? 'document.graph',
     },
   };
 }
