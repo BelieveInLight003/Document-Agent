@@ -1,36 +1,65 @@
-import { Injectable, UnauthorizedException } from '@nestjs/common';
+import {
+  BadRequestException,
+  Injectable,
+  UnauthorizedException,
+} from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { JwtService, type JwtSignOptions } from '@nestjs/jwt';
 import bcrypt from 'bcrypt';
 import { LoginDto } from './dto/login.dto.js';
 import { RefreshDto } from './dto/refresh.dto.js';
 import { RegisterDto } from './dto/register.dto.js';
+import { EmailVerificationService } from './email-verification.service.js';
 import { RoleCode } from '../user/role-code.js';
 import { UserService, type UserProfile } from '../user/user.service.js';
 import { UserStatus } from '../user/user-status.js';
 
-/** 登录和令牌。用户写入、角色绑定交给 UserService。 */
+/** 登录和令牌。用户写入交给 UserService，邮箱激活交给 EmailVerificationService。 */
 @Injectable()
 export class AuthService {
   constructor(
     private readonly userService: UserService,
+    private readonly emailVerification: EmailVerificationService,
     private readonly jwtService: JwtService,
     private readonly config: ConfigService,
   ) {}
 
-  /** 注册为普通用户。用户名冲突和角色绑定由用户模块处理。 */
-  register(dto: RegisterDto) {
-    return this.userService.create({
-      username: dto.username,
-      password: dto.password,
-      email: dto.email,
-      realName: dto.realName,
-      roleCodes: [RoleCode.USER],
-    });
+  /**
+   * 注册为普通用户。邮箱必填。
+   * 邮箱验证开启时，email_verified 先写 false，再发激活链接。
+   * 关闭时直接写成已激活，注册后即可登录。
+   */
+  async register(dto: RegisterDto) {
+    const verifyEmail = this.emailVerification.enabled();
+    const profile = await this.userService.create(
+      {
+        username: dto.username,
+        password: dto.password,
+        email: dto.email,
+        realName: dto.realName,
+        roleCodes: [RoleCode.USER],
+      },
+      { emailVerified: !verifyEmail },
+    );
+    if (!verifyEmail) {
+      return profile;
+    }
+    if (!profile.email) {
+      throw new BadRequestException('邮箱不能为空');
+    }
+    const activationLink = await this.emailVerification.issue(
+      profile.id,
+      profile.email,
+    );
+    return {
+      ...profile,
+      activationLink,
+    };
   }
 
   /**
    * 登录：查用户 → 对密码 → 确认账号启用 → 写最后登录时间 → 发两张令牌。
+   * 邮箱验证开启时，未激活账号不能登录。
    * 用户不存在和密码错误返回同一句话，避免别人试出用户名是否存在。
    */
   async login(dto: LoginDto) {
@@ -43,6 +72,9 @@ export class AuthService {
     }
     if (user.status !== UserStatus.ENABLED) {
       throw new UnauthorizedException('账号已禁用');
+    }
+    if (this.emailVerification.enabled() && !user.emailVerified) {
+      throw new UnauthorizedException('邮箱未激活');
     }
 
     await this.userService.touchLastLogin(user);

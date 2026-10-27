@@ -19,10 +19,10 @@ export class RegisterDto {
   @MaxLength(50)
   password: string;
 
-  @IsOptional()
   @IsEmail()
+  @IsNotEmpty()
   @MaxLength(100)
-  email?: string;
+  email: string;
 
   @IsOptional()
   @IsString()

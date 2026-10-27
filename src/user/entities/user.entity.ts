@@ -40,6 +40,10 @@ export class User {
   @Column({ type: 'smallint', default: 1 })
   status: number;
 
+  /** 注册时为 false，点开激活链接后改为 true。管理员创建的账号直接为 true。 */
+  @Column({ name: 'email_verified', type: 'boolean', default: false })
+  emailVerified: boolean;
+
   @Column({ name: 'last_login_at', type: 'timestamp', nullable: true })
   lastLoginAt: Date | null;
 

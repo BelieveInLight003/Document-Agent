@@ -57,6 +57,7 @@ CREATE TABLE IF NOT EXISTS kh_user (
     real_name VARCHAR(50),                          -- 真实姓名 / 显示名
     avatar VARCHAR(500),                            -- 头像 URL
     status SMALLINT NOT NULL DEFAULT 1,             -- 0 禁用 1 启用
+    email_verified BOOLEAN NOT NULL DEFAULT false,  -- 邮箱是否已激活
     last_login_at TIMESTAMP,                        -- 最后登录时间
     created_at TIMESTAMP NOT NULL DEFAULT NOW(),    -- 创建时间
     updated_at TIMESTAMP NOT NULL DEFAULT NOW(),    -- 更新时间
@@ -64,6 +65,8 @@ CREATE TABLE IF NOT EXISTS kh_user (
 );
 -- 未删除用户名唯一
 CREATE UNIQUE INDEX IF NOT EXISTS uk_kh_user_username ON kh_user(username) WHERE deleted = false;
+-- 未删除且填写了邮箱时，邮箱唯一
+CREATE UNIQUE INDEX IF NOT EXISTS uk_kh_user_email ON kh_user(email) WHERE deleted = false AND email IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS kh_role (
     id BIGINT PRIMARY KEY,                          -- 角色 ID（雪花）
@@ -90,10 +93,10 @@ INSERT INTO kh_role (id, role_name, role_code, description) VALUES
 ON CONFLICT (id) DO NOTHING;
 
 -- 测试账号（密码均为 123456，bcrypt）
-INSERT INTO kh_user (id, username, password, email, real_name, status) VALUES
-    (1000000000000000001, 'admin', '$2a$10$N.zmdr9k7uOCQb376NoUnuTJ8iAt6Z5EHsM8lE9lBOsl7iKTVKIUi', 'admin@company.com', '系统管理员', 1),
-    (1000000000000000002, 'reviewer', '$2a$10$N.zmdr9k7uOCQb376NoUnuTJ8iAt6Z5EHsM8lE9lBOsl7iKTVKIUi', 'reviewer@company.com', '审核员张三', 1),
-    (1000000000000000003, 'user', '$2a$10$N.zmdr9k7uOCQb376NoUnuTJ8iAt6Z5EHsM8lE9lBOsl7iKTVKIUi', 'user@company.com', '普通用户李四', 1)
+INSERT INTO kh_user (id, username, password, email, real_name, status, email_verified) VALUES
+    (1000000000000000001, 'admin', '$2a$10$N.zmdr9k7uOCQb376NoUnuTJ8iAt6Z5EHsM8lE9lBOsl7iKTVKIUi', 'admin@company.com', '系统管理员', 1, true),
+    (1000000000000000002, 'reviewer', '$2a$10$N.zmdr9k7uOCQb376NoUnuTJ8iAt6Z5EHsM8lE9lBOsl7iKTVKIUi', 'reviewer@company.com', '审核员张三', 1, true),
+    (1000000000000000003, 'user', '$2a$10$N.zmdr9k7uOCQb376NoUnuTJ8iAt6Z5EHsM8lE9lBOsl7iKTVKIUi', 'user@company.com', '普通用户李四', 1, true)
 ON CONFLICT (id) DO NOTHING;
 
 INSERT INTO kh_user_role (id, user_id, role_id) VALUES

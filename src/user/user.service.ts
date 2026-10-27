@@ -25,6 +25,7 @@ export type UserProfile = {
   realName: string | null;
   avatar: string | null;
   status: number;
+  emailVerified: boolean;
   lastLoginAt: Date | null;
   roles: string[];
 };
@@ -51,6 +52,17 @@ export class UserService {
     });
   }
 
+  /** 按邮箱查未删除用户。忘记密码用，邮箱按注册时保存的原文匹配。 */
+  findByEmail(email: string) {
+    const normalized = email.trim();
+    if (!normalized) {
+      return null;
+    }
+    return this.userRepository.findOne({
+      where: { email: normalized, deleted: false },
+    });
+  }
+
   /** 按 id 查未删除且启用的用户。刷新令牌和当前用户资料用。 */
   findActiveById(id: string) {
     if (!/^\d+$/.test(id)) {
@@ -74,13 +86,35 @@ export class UserService {
     await this.userRepository.save(user);
   }
 
+  /** 激活链接核对通过后，把邮箱标记为已验证。 */
+  async markEmailVerified(id: string) {
+    const user = await this.requireUser(id);
+    user.emailVerified = true;
+    await this.userRepository.save(user);
+    return this.toProfile(user);
+  }
+
+  /** 重置链接核对通过后，用新密码覆盖哈希。不改账号状态和邮箱验证状态。 */
+  async resetPassword(id: string, password: string) {
+    const user = await this.requireUser(id);
+    user.password = await bcrypt.hash(password, 10);
+    await this.userRepository.save(user);
+  }
+
   /**
    * 新建用户并绑定角色。不传角色时绑定普通用户。
    * 注册和管理员创建都走这里。
    */
-  async create(dto: CreateUserDto): Promise<UserProfile> {
+  async create(
+    dto: CreateUserDto,
+    options?: { emailVerified?: boolean },
+  ): Promise<UserProfile> {
     const username = dto.username.trim();
+    const email = this.emptyToNull(dto.email);
     await this.ensureUsernameAvailable(username);
+    if (email) {
+      await this.ensureEmailAvailable(email);
+    }
     const roleCodes = dto.roleCodes?.length ? dto.roleCodes : [RoleCode.USER];
     const password = await bcrypt.hash(dto.password, 10);
     const saved = await this.dataSource.transaction(async (manager) => {
@@ -88,10 +122,11 @@ export class UserService {
         manager.create(User, {
           username,
           password,
-          email: this.emptyToNull(dto.email),
+          email,
           realName: this.emptyToNull(dto.realName),
           avatar: this.emptyToNull(dto.avatar),
           status: dto.status ?? UserStatus.ENABLED,
+          emailVerified: options?.emailVerified ?? true,
           lastLoginAt: null,
           deleted: false,
         }),
@@ -256,6 +291,15 @@ export class UserService {
     }
   }
 
+  private async ensureEmailAvailable(email: string, exceptId?: bigint) {
+    const existing = await this.userRepository.findOne({
+      where: { email, deleted: false },
+    });
+    if (existing && existing.id !== exceptId) {
+      throw new ConflictException('邮箱已存在');
+    }
+  }
+
   private async ensureUsernameAvailable(username: string, exceptId?: bigint) {
     const existing = await this.userRepository.findOne({
       where: { username, deleted: false },
@@ -369,6 +413,7 @@ export class UserService {
       realName: user.realName,
       avatar: user.avatar,
       status: user.status,
+      emailVerified: user.emailVerified,
       lastLoginAt: user.lastLoginAt,
       roles,
     };
