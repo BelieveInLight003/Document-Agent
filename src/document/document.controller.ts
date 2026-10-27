@@ -28,7 +28,7 @@ export class DocumentController {
     return this.documentService.create(createDocumentDto);
   }
 
-  @Post('parse/upload')
+  @Post('upload/parse')
   @UseInterceptors(FileInterceptor('file'))
   parseUpload(
     @UploadedFile() file: SourceFile,

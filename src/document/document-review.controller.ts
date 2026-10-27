@@ -1,4 +1,6 @@
 import { Body, Controller, Get, Param, Post, Put, Query } from '@nestjs/common';
+import { RoleCode } from '../user/role-code.js';
+import { Roles } from '../auth/roles.decorator.js';
 import { DocumentReviewService } from './document-review.service.js';
 import { ApproveReviewDto } from './dto/approve-review.dto.js';
 import { PendingReviewQueryDto } from './dto/pending-review-query.dto.js';
@@ -10,13 +12,15 @@ import { SubmitReviewDto } from './dto/submit-review.dto.js';
 export class DocumentReviewController {
   constructor(private readonly documentReviewService: DocumentReviewService) {}
 
-  /** 待审核数量。 */
+  /** 待审核数量。管理员和审核员可查。 */
+  @Roles(RoleCode.ADMIN, RoleCode.REVIEWER)
   @Get('reviews/pending/count')
   countPending() {
     return this.documentReviewService.countPending();
   }
 
-  /** 待审核列表，可按页查询。 */
+  /** 待审核列表，可按页查询。管理员和审核员可查。 */
+  @Roles(RoleCode.ADMIN, RoleCode.REVIEWER)
   @Get('reviews/pending')
   listPending(@Query() query: PendingReviewQueryDto) {
     return this.documentReviewService.listPending(query);
@@ -41,12 +45,14 @@ export class DocumentReviewController {
   }
 
   /** 驳回。参数是审核单 taskId，找到对应文档后改回草稿。审核意见必填。 */
+  @Roles(RoleCode.ADMIN, RoleCode.REVIEWER)
   @Post('reviews/:taskId/reject')
   reject(@Param('taskId') taskId: string, @Body() dto: RejectReviewDto) {
     return this.documentReviewService.reject(taskId, dto);
   }
 
   /** 通过。参数是审核单 taskId，找到对应文档后改为已发布并重建三个索引。 */
+  @Roles(RoleCode.ADMIN, RoleCode.REVIEWER)
   @Post('reviews/:taskId/approve')
   approve(@Param('taskId') taskId: string, @Body() dto: ApproveReviewDto) {
     return this.documentReviewService.approve(taskId, dto);
