@@ -99,8 +99,9 @@ export class RabbitmqConsumer
       await handler(payload);
       channel.ack(message);
     } catch (error) {
-      const detail = error instanceof Error ? error.message : '处理失败';
-      this.logger.error(`消息处理失败：${detail}`);
+      const routingKey = message.fields.routingKey;
+      const detail = describeError(error);
+      this.logger.error(`消息处理失败 routingKey=${routingKey} ${detail}`);
       await this.retryOrDrop(channel, message);
     }
   }
@@ -125,4 +126,17 @@ export class RabbitmqConsumer
     );
     channel.ack(message);
   }
+}
+
+function describeError(error: unknown) {
+  if (!(error instanceof Error)) {
+    return String(error);
+  }
+  const cause =
+    error.cause instanceof Error
+      ? ` cause=${error.cause.message}`
+      : '';
+  const body = (error as { meta?: { body?: unknown } }).meta?.body;
+  const response = body == null ? '' : ` body=${JSON.stringify(body)}`;
+  return `${error.name}: ${error.message}${cause}${response}`;
 }

@@ -2,7 +2,7 @@
 CREATE TABLE IF NOT EXISTS kh_document (
     id BIGINT PRIMARY KEY,
     title VARCHAR NOT NULL,
-    content_id VARCHAR NOT NULL UNIQUE,
+    content_id VARCHAR NOT NULL UNIQUE, -- MongoDB document_content 的 _id
     summary VARCHAR,
     category_id BIGINT,
     team_id BIGINT,

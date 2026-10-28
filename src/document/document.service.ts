@@ -2,10 +2,11 @@ import {
   BadRequestException,
   Injectable,
   NotFoundException,
+  OnModuleInit,
 } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Model } from 'mongoose';
+import { Model, Types } from 'mongoose';
 import path from 'node:path';
 import { Repository } from 'typeorm';
 import { detectParser, parseToMarkdown } from '../parser/index.js';
@@ -21,10 +22,9 @@ import {
   DocumentContent,
   type DocumentContentDocument,
 } from './schema/document.content.schema.js';
-import { snowflake } from './snowflake.js';
 
 @Injectable()
-export class DocumentService {
+export class DocumentService implements OnModuleInit {
   constructor(
     @InjectModel(DocumentContent.name)
     private readonly documentContentModel: Model<DocumentContentDocument>,
@@ -33,6 +33,57 @@ export class DocumentService {
     private readonly rustfsService: RustfsService,
     private readonly pipelineManagerService: PipelineManagerService,
   ) {}
+
+  /**
+   * 旧正文用雪花 contentId 关联。启动时把 Postgres content_id 改成对应 Mongo _id，
+   * 再去掉这个字段和唯一索引。
+   */
+  async onModuleInit() {
+    let legacy: Array<{ _id: Types.ObjectId; contentId?: string }>;
+    try {
+      // 原生集合返回的是 Mongo 文档。同文件里的 Document 实体会挡住驱动的 Document 类型。
+      legacy = (await this.documentContentModel.collection
+        .find({ contentId: { $type: 'string' } })
+        .project({ contentId: 1 })
+        .toArray()) as unknown as Array<{
+        _id: Types.ObjectId;
+        contentId?: string;
+      }>;
+    } catch (error) {
+      if ((error as { code?: number }).code === 26) {
+        return;
+      }
+      throw error;
+    }
+
+    for (const item of legacy) {
+      const previousId = item.contentId;
+      if (!previousId) {
+        continue;
+      }
+      const mongoId = item._id.toString();
+      const updated = await this.documentRepository.update(
+        { contentId: previousId },
+        { contentId: mongoId },
+      );
+      const linked =
+        (updated.affected ?? 0) > 0 ||
+        (await this.documentRepository.findOne({
+          where: { contentId: mongoId },
+        }));
+      if (linked) {
+        await this.documentContentModel.collection.updateOne(
+          { _id: item._id },
+          { $unset: { contentId: '' } },
+        );
+      }
+    }
+
+    const indexes = await this.documentContentModel.collection.indexes();
+    if (indexes.some((index) => index.name === 'contentId_1')) {
+      await this.documentContentModel.collection.dropIndex('contentId_1');
+    }
+  }
 
   async create(createDocumentDto: CreateDocumentDto) {
     return this.storeDocument({
@@ -143,15 +194,13 @@ export class DocumentService {
     const source = input.sourceFile
       ? await this.rustfsService.uploadSourceFile(input.sourceFile)
       : undefined;
-    const contentId = snowflake.generate();
-
-    await this.documentContentModel.create({
-      contentId,
+    const created = await this.documentContentModel.create({
       content: input.markdown,
       length: input.markdown.length,
       contentSummary: input.summary,
       deleted: false,
     });
+    const contentId = created._id.toString();
 
     try {
       const document = await this.documentRepository.save(
@@ -186,7 +235,7 @@ export class DocumentService {
         source,
       };
     } catch (error) {
-      await this.documentContentModel.deleteOne({ contentId });
+      await this.documentContentModel.deleteOne({ _id: created._id });
       throw error;
     }
   }
@@ -241,13 +290,18 @@ export class DocumentService {
       return [];
     }
 
+    const contentIds = documents
+      .map((item) => item.contentId)
+      .filter((contentId) => Types.ObjectId.isValid(contentId));
     const contents = await this.documentContentModel
       .find({
-        contentId: { $in: documents.map((item) => item.contentId) },
+        _id: { $in: contentIds },
         deleted: false,
       })
       .lean();
-    const contentMap = new Map(contents.map((item) => [item.contentId, item]));
+    const contentMap = new Map(
+      contents.map((item) => [item._id.toString(), item]),
+    );
 
     return documents.map((document) => ({
       document: this.serializeDocument(document),
@@ -259,9 +313,7 @@ export class DocumentService {
 
   async findOne(id: string) {
     const document = await this.findDocument(id);
-    const content = await this.documentContentModel
-      .findOne({ contentId: document.contentId, deleted: false })
-      .lean();
+    const content = await this.findContent(document.contentId, false);
 
     return {
       document: this.serializeDocument(document),
@@ -322,17 +374,18 @@ export class DocumentService {
     if (updateDocumentDto.summary !== undefined) {
       contentUpdate.contentSummary = updateDocumentDto.summary;
     }
-    if (Object.keys(contentUpdate).length > 0) {
+    if (
+      Object.keys(contentUpdate).length > 0 &&
+      Types.ObjectId.isValid(document.contentId)
+    ) {
       await this.documentContentModel.updateOne(
-        { contentId: document.contentId },
+        { _id: document.contentId },
         { $set: contentUpdate },
       );
     }
 
     const saved = await this.documentRepository.save(document);
-    const content = await this.documentContentModel
-      .findOne({ contentId: document.contentId })
-      .lean();
+    const content = await this.findContent(document.contentId);
 
     return {
       document: this.serializeDocument(saved),
@@ -345,7 +398,9 @@ export class DocumentService {
     const contentId = document.contentId;
 
     await this.pipelineManagerService.removeDocument(document.id.toString());
-    await this.documentContentModel.deleteOne({ contentId });
+    if (Types.ObjectId.isValid(contentId)) {
+      await this.documentContentModel.deleteOne({ _id: contentId });
+    }
     await this.documentRepository.delete({ id: document.id });
 
     return {
@@ -371,9 +426,21 @@ export class DocumentService {
     return document;
   }
 
+  private findContent(contentId: string, deleted?: boolean) {
+    if (!Types.ObjectId.isValid(contentId)) {
+      return null;
+    }
+    return this.documentContentModel
+      .findOne({
+        _id: contentId,
+        ...(deleted === undefined ? {} : { deleted }),
+      })
+      .lean();
+  }
+
   private serializeContent(
     content: {
-      contentId: string;
+      _id: { toString(): string };
       content: string;
       length: number;
       contentSummary?: string;
@@ -384,7 +451,7 @@ export class DocumentService {
       return null;
     }
     return {
-      contentId: content.contentId,
+      contentId: content._id.toString(),
       content: content.content,
       length: content.length,
       contentSummary: content.contentSummary ?? '',

@@ -3,6 +3,8 @@ import { createObserveModule } from '@nestjs/observe';
 import { AppController } from './app.controller.js';
 import { AppService } from './app.service.js';
 import { DocumentModule } from './document/document.module.js';
+import { GraphModule } from './graph/graph.module.js';
+import { SearchModule } from './search/search.module.js';
 import { StorageModule } from './storage/storage.module.js';
 import { AuthModule } from './auth/auth.module.js';
 import { TeamModule } from './team/team.module.js';
@@ -20,6 +22,8 @@ export const { ObserveModule, ObserveInstrument } = createObserveModule();
       serviceId: 'backend',
     }),
     DocumentModule,
+    SearchModule,
+    GraphModule,
     StorageModule,
     UserModule,
     TeamModule,

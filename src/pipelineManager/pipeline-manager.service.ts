@@ -1,6 +1,6 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
-import { Model } from 'mongoose';
+import { Model, Types } from 'mongoose';
 import {
   DocumentContent,
   type DocumentContentDocument,
@@ -118,9 +118,13 @@ export class PipelineManagerService implements OnModuleInit {
     );
   }
 
+  /** contentId 是 MongoDB document_content 的 _id。 */
   private async loadContent(contentId: string) {
+    if (!Types.ObjectId.isValid(contentId)) {
+      throw new Error('文档内容不存在');
+    }
     const document = await this.documentContentModel
-      .findOne({ contentId, deleted: false })
+      .findOne({ _id: contentId, deleted: false })
       .lean();
     if (!document?.content?.trim()) {
       throw new Error('文档内容不存在');

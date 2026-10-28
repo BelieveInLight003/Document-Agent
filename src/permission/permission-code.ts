@@ -4,6 +4,7 @@ export const PermissionCode = {
   DOCUMENT_EDIT: 'document:edit',
   DOCUMENT_DELETE: 'document:delete',
   DOCUMENT_REVIEW: 'document:review',
+  SEARCH: 'search',
   SYSTEM_USER: 'system:user',
   SYSTEM_ROLE: 'system:role',
   SYSTEM_TEAM: 'system:team',

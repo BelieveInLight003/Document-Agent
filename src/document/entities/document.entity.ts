@@ -29,6 +29,7 @@ export class Document {
   @Column({ type: 'varchar' })
   title: string;
 
+  /** MongoDB document_content 的 _id */
   @Column({ name: 'content_id', type: 'varchar', unique: true })
   contentId: string;
 

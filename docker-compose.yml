@@ -144,6 +144,7 @@ services:
   es:
     build: ./elasticsearch # 从本地 Dockerfile 构建镜像（自带IK）
     container_name: knowledge_hub_elasticsearch
+    hostname: elasticsearch
     ports:
       - '9200:9200' # ES 访问端口
     environment:

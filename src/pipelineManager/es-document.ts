@@ -28,6 +28,15 @@ function getClient(node: string) {
   return client;
 }
 
+/** 全文检索和写入共用同一个客户端。未启用时返回 null。 */
+export function getEsDocumentTarget(): { client: Client; index: string } | null {
+  const config = getElasticsearchConfig();
+  if (!config.enabled) {
+    return null;
+  }
+  return { client: getClient(config.node), index: config.index };
+}
+
 async function ensureIndex(es: Client, index: string) {
   const exists = await es.indices.exists({ index });
   if (exists) {

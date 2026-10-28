@@ -5,15 +5,12 @@ export type DocumentContentFormat = 'markdown' | 'html' | 'text';
 
 export type DocumentContentDocument = HydratedDocument<DocumentContent>;
 
-/** 文档内容。contentId 为雪花 ID，对应同一篇文档 */
+/** 文档正文。文档身份用 MongoDB 自己的 _id，Postgres kh_document.content_id 存这个值。 */
 @Schema({
   collection: 'document_content',
   timestamps: true,
 })
 export class DocumentContent {
-  @Prop({ type: String, required: true, unique: true })
-  contentId: string;
-
   @Prop({ type: String, required: true, default: '' })
   content: string;
 

@@ -41,6 +41,15 @@ function getDriver(config: Neo4jConfig) {
   return driver;
 }
 
+/** 图谱检索和写入共用同一个驱动。未启用时返回 null。 */
+export function getNeo4jTarget(): { driver: Driver; database: string } | null {
+  const config = getNeo4jConfig();
+  if (!config.enabled) {
+    return null;
+  }
+  return { driver: getDriver(config), database: config.database };
+}
+
 export type GraphWriteResult = {
   chunks: number;
   entities: number;
