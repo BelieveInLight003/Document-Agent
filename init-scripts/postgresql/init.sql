@@ -260,3 +260,26 @@ INSERT INTO kh_team_member (id, team_id, user_id, member_role) VALUES
     (9000000000000000002, 8000000000000000002, 1000000000000000001, 'leader'),
     (9000000000000000003, 8000000000000000002, 1000000000000000003, 'member')
 ON CONFLICT (id) DO NOTHING;
+
+-- 问答会话。一个用户可以有多段会话。
+CREATE TABLE IF NOT EXISTS kh_chat_session (
+    id BIGINT PRIMARY KEY,
+    user_id BIGINT NOT NULL,
+    title VARCHAR(200) NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_kh_chat_session_user_id
+    ON kh_chat_session (user_id, updated_at DESC);
+
+-- 会话里的消息。删除会话时，关联消息一并删除。
+CREATE TABLE IF NOT EXISTS kh_chat_message (
+    id BIGINT PRIMARY KEY,
+    session_id BIGINT NOT NULL REFERENCES kh_chat_session(id) ON DELETE CASCADE,
+    role VARCHAR(20) NOT NULL, -- user / assistant
+    content TEXT NOT NULL,
+    payload JSONB,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_kh_chat_message_session_id
+    ON kh_chat_message (session_id, created_at, id);
