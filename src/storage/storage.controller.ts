@@ -11,14 +11,17 @@ import {
   UseInterceptors,
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
+import { PermissionCode } from '../permission/permission-code.js';
+import { Permissions } from '../permission/permissions.decorator.js';
 import { RustfsService, type SourceFile } from './rustfs.service.js';
 
 @Controller('storage')
 export class StorageController {
   constructor(private readonly rustfsService: RustfsService) {}
 
+  @Permissions(PermissionCode.DOCUMENT_CREATE)
   @Post('source')
-  @UseInterceptors(FileInterceptor('file'))
+  @UseInterceptors(FileInterceptor('file', { defParamCharset: 'utf8' }))
   uploadSource(@UploadedFile() file: SourceFile) {
     return this.rustfsService.uploadSourceFile(file);
   }

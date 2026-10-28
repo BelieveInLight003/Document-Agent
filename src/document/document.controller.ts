@@ -33,7 +33,7 @@ export class DocumentController {
 
   @Permissions(PermissionCode.DOCUMENT_CREATE)
   @Post('upload/parse')
-  @UseInterceptors(FileInterceptor('file'))
+  @UseInterceptors(FileInterceptor('file', { defParamCharset: 'utf8' }))
   parseUpload(
     @UploadedFile() file: SourceFile,
     @Body() parseUploadDto: ParseUploadDto,
@@ -47,16 +47,19 @@ export class DocumentController {
     return this.documentService.publish(id);
   }
 
+  @Permissions(PermissionCode.DOCUMENT, PermissionCode.DOCUMENT_LIST)
   @Get()
   findAll() {
     return this.documentService.findAll();
   }
 
+  @Permissions(PermissionCode.DOCUMENT, PermissionCode.DOCUMENT_LIST)
   @Get(':id')
   findOne(@Param('id') id: string) {
     return this.documentService.findOne(id);
   }
 
+  @Permissions(PermissionCode.DOCUMENT_EDIT)
   @Patch(':id')
   update(
     @Param('id') id: string,

@@ -8,6 +8,7 @@ import { InjectRepository } from '@nestjs/typeorm';
 import bcrypt from 'bcrypt';
 import { DataSource, EntityManager, In, Like, Repository } from 'typeorm';
 import { AssignRolesDto } from './dto/assign-roles.dto.js';
+import { CreateRoleDto } from './dto/create-role.dto.js';
 import { CreateUserDto } from './dto/create-user.dto.js';
 import { UpdateProfileDto } from './dto/update-profile.dto.js';
 import { UpdateUserDto } from './dto/update-user.dto.js';
@@ -231,12 +232,35 @@ export class UserService {
       where: { status: UserStatus.ENABLED },
       order: { id: 'ASC' },
     });
-    return roles.map((role) => ({
+    return roles.map((role) => this.roleView(role));
+  }
+
+  /** 新建角色。编码在库里唯一，权限由调用方在创建后绑定。 */
+  async createRole(dto: CreateRoleDto) {
+    const roleCode = dto.roleCode.trim();
+    const existing = await this.roleRepository.findOne({ where: { roleCode } });
+    if (existing) {
+      throw new ConflictException('角色编码已存在');
+    }
+    const saved = await this.roleRepository.save(
+      this.roleRepository.create({
+        roleName: dto.roleName.trim(),
+        roleCode,
+        description: dto.description?.trim() || null,
+        status: dto.status ?? UserStatus.ENABLED,
+      }),
+    );
+    return this.roleView(saved);
+  }
+
+  private roleView(role: Role) {
+    return {
       id: role.id.toString(),
       roleName: role.roleName,
       roleCode: role.roleCode,
       description: role.description,
-    }));
+      status: role.status,
+    };
   }
 
   /** 某个启用角色下、账号仍启用的用户。审批员列表用这个。 */

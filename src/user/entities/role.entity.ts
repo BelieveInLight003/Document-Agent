@@ -1,4 +1,5 @@
-import { Column, Entity, PrimaryColumn } from 'typeorm';
+import { BeforeInsert, Column, Entity, PrimaryColumn } from 'typeorm';
+import { snowflake } from '../../document/snowflake.js';
 import { bigintTransformer } from '../bigint.js';
 
 /** 角色。编码如 ROLE_ADMIN、ROLE_REVIEWER、ROLE_USER。 */
@@ -6,6 +7,13 @@ import { bigintTransformer } from '../bigint.js';
 export class Role {
   @PrimaryColumn({ type: 'bigint', transformer: bigintTransformer })
   id: bigint;
+
+  @BeforeInsert()
+  assignSnowflakeId() {
+    if (this.id == null) {
+      this.id = BigInt(snowflake.generate());
+    }
+  }
 
   @Column({ name: 'role_name', type: 'varchar' })
   roleName: string;

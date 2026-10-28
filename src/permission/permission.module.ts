@@ -10,6 +10,7 @@ import { PermissionController } from './permission.controller.js';
 import { PermissionService } from './permission.service.js';
 import { RolePermissionController } from './role-permission.controller.js';
 import { RolePermissionService } from './role-permission.service.js';
+import { PermissionSeedService } from './permission-seed.service.js';
 import { UserPermissionController } from './user-permission.controller.js';
 import { UserPermissionService } from './user-permission.service.js';
 
@@ -30,7 +31,12 @@ import { UserPermissionService } from './user-permission.service.js';
     RolePermissionController,
     UserPermissionController,
   ],
-  providers: [PermissionService, RolePermissionService, UserPermissionService],
-  exports: [UserPermissionService],
+  providers: [
+    PermissionService,
+    PermissionSeedService,
+    RolePermissionService,
+    UserPermissionService,
+  ],
+  exports: [UserPermissionService, RolePermissionService],
 })
 export class PermissionModule {}

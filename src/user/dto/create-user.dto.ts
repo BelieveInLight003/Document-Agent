@@ -7,10 +7,10 @@ import {
   IsNotEmpty,
   IsOptional,
   IsString,
+  Matches,
   MaxLength,
   MinLength,
 } from 'class-validator';
-import { ROLE_CODES } from '../role-code.js';
 import { UserStatus } from '../user-status.js';
 
 export class CreateUserDto {
@@ -50,6 +50,6 @@ export class CreateUserDto {
   @IsArray()
   @ArrayMinSize(1)
   @IsString({ each: true })
-  @IsIn(ROLE_CODES, { each: true })
+  @Matches(/^ROLE_[A-Z0-9_]+$/, { each: true })
   roleCodes?: string[];
 }

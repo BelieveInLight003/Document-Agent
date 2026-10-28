@@ -9,6 +9,7 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { Model, Types } from 'mongoose';
 import path from 'node:path';
 import { Repository } from 'typeorm';
+import { decodeUploadedText } from './decode-uploaded-text.js';
 import { detectParser, parseToMarkdown } from '../parser/index.js';
 import { PipelineManagerService } from '../pipelineManager/pipeline-manager.service.js';
 import { RustfsService, type SourceFile } from '../storage/rustfs.service.js';
@@ -122,6 +123,7 @@ export class DocumentService implements OnModuleInit {
     }
 
     const publishedAt = new Date();
+    document.title = decodeUploadedText(document.title);
     await this.pipelineManagerService.publishDocument({
       documentId: document.id.toString(),
       contentId: document.contentId,
@@ -143,7 +145,9 @@ export class DocumentService implements OnModuleInit {
       throw new BadRequestException('文件不能为空');
     }
 
-    const parser = detectParser(file.originalname || '');
+    const originalname = decodeUploadedText(file.originalname || '');
+    const namedFile = { ...file, originalname };
+    const parser = detectParser(originalname);
     if (!parser) {
       throw new BadRequestException(
         '仅支持 doc、docx、xml、ppt、pptx、txt、xls、xlsx、pdf',
@@ -159,7 +163,7 @@ export class DocumentService implements OnModuleInit {
       markdown,
       title:
         parseUploadDto.title?.trim() ||
-        this.extractTitle(markdown, file.originalname),
+        this.extractTitle(markdown, originalname),
       summary: parseUploadDto.summary?.trim() || this.extractSummary(markdown),
       categoryId: parseUploadDto.categoryId,
       teamId: parseUploadDto.teamId,
@@ -167,10 +171,10 @@ export class DocumentService implements OnModuleInit {
       coverImage: parseUploadDto.coverImage,
       tags: parseUploadDto.tags,
       status: parseUploadDto.status,
-      remark: parseUploadDto.remark ?? file.originalname,
+      remark: parseUploadDto.remark ?? originalname,
       isPublic: parseUploadDto.isPublic,
       createBy: parseUploadDto.createBy,
-      sourceFile: file,
+      sourceFile: namedFile,
     });
   }
 
@@ -246,9 +250,12 @@ export class DocumentService implements OnModuleInit {
       .map((line) => /^#{1,6}\s+(.+)$/.exec(line.trim())?.[1])
       .find(Boolean);
     if (heading) {
-      return heading.trim();
+      return decodeUploadedText(heading.trim());
     }
-    return path.basename(filename, path.extname(filename)) || '未命名文档';
+    return (
+      decodeUploadedText(path.basename(filename, path.extname(filename))) ||
+      '未命名文档'
+    );
   }
 
   private extractSummary(markdown: string) {
@@ -273,6 +280,8 @@ export class DocumentService implements OnModuleInit {
     return {
       ...document,
       id: document.id.toString(),
+      title: decodeUploadedText(document.title),
+      remark: document.remark ? decodeUploadedText(document.remark) : null,
       categoryId: document.categoryId?.toString() ?? null,
       teamId: document.teamId?.toString() ?? null,
       authorId: document.authorId?.toString() ?? null,

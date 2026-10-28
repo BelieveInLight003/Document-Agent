@@ -12,6 +12,7 @@ import { ApproveReviewDto } from './dto/approve-review.dto.js';
 import { PendingReviewQueryDto } from './dto/pending-review-query.dto.js';
 import { RejectReviewDto } from './dto/reject-review.dto.js';
 import { SubmitReviewDto } from './dto/submit-review.dto.js';
+import { decodeUploadedText } from './decode-uploaded-text.js';
 import { Document } from './entities/document.entity.js';
 import { DocumentReview } from './entities/document-review.entity.js';
 
@@ -113,6 +114,7 @@ export class DocumentReviewService {
     const wasPublished = review.statusBefore === DocumentStatus.PUBLISHED;
 
     const publishedAt = new Date();
+    document.title = decodeUploadedText(document.title);
     await this.pipelineManagerService.publishDocument({
       documentId: documentIdText,
       contentId: document.contentId,
@@ -261,7 +263,7 @@ export class DocumentReviewService {
       where: { id: In(ids) },
     });
     for (const document of documents) {
-      titles.set(document.id.toString(), document.title);
+      titles.set(document.id.toString(), decodeUploadedText(document.title));
     }
     return titles;
   }

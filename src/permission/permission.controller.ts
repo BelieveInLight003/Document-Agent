@@ -8,8 +8,6 @@ import {
   Post,
   Query,
 } from '@nestjs/common';
-import { Roles } from '../auth/roles.decorator.js';
-import { RoleCode } from '../user/role-code.js';
 import { CreatePermissionDto } from './dto/create-permission.dto.js';
 import { PermissionQueryDto } from './dto/permission-query.dto.js';
 import { UpdatePermissionDto } from './dto/update-permission.dto.js';
@@ -17,9 +15,8 @@ import { PermissionCode } from './permission-code.js';
 import { PermissionService } from './permission.service.js';
 import { Permissions } from './permissions.decorator.js';
 
-/** 权限目录。管理员角色，并且要有对应的权限编码。 */
+/** 权限目录。按权限编码控制，不再额外要求管理员角色名。 */
 @Controller('permissions')
-@Roles(RoleCode.ADMIN)
 export class PermissionController {
   constructor(private readonly permissionService: PermissionService) {}
 
@@ -30,8 +27,8 @@ export class PermissionController {
     return this.permissionService.create(dto);
   }
 
-  /** 权限列表，可按父级、编码、状态筛选。 */
-  @Permissions(PermissionCode.SYSTEM_PERMISSION)
+  /** 权限列表。配置角色时也要能读到目录。 */
+  @Permissions(PermissionCode.SYSTEM_PERMISSION, PermissionCode.SYSTEM_ROLE)
   @Get()
   findAll(@Query() query: PermissionQueryDto) {
     return this.permissionService.findAll(query);

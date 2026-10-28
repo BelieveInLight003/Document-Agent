@@ -11,6 +11,7 @@ import neo4j, {
   type Relationship,
 } from 'neo4j-driver';
 import { In, Repository } from 'typeorm';
+import { decodeUploadedText } from '../document/decode-uploaded-text.js';
 import { Document } from '../document/entities/document.entity.js';
 import { getNeo4jTarget } from '../pipelineManager/graph.js';
 import { GraphNodeQueryDto } from './dto/graph-node-query.dto.js';
@@ -195,17 +196,18 @@ export class GraphService {
         if (!row) {
           return node;
         }
+        const title = decodeUploadedText(row.title);
         const document: GraphDocumentBrief = {
           id: row.id.toString(),
-          title: row.title,
+          title,
           contentId: row.contentId,
-          summary: row.summary,
+          summary: row.summary ? decodeUploadedText(row.summary) : null,
           status: row.status,
         };
         return {
           ...node,
-          name: row.title,
-          title: row.title,
+          name: title,
+          title,
           contentId: row.contentId,
           document,
         };
@@ -322,10 +324,13 @@ function toNodeView(node: Node): GraphNodeView {
     NODE_LABELS.find((item) => node.labels.includes(item)) ??
     node.labels[0] ??
     'Node';
-  const title = text(properties.title);
-  const entityType = label === 'Entity' ? text(properties.type) : null;
+  const title = readable(text(properties.title));
+  const entityType = label === 'Entity' ? readable(text(properties.type)) : null;
   const name =
-    text(properties.name) ?? title ?? text(properties.chunkId) ?? '未命名';
+    readable(text(properties.name)) ??
+    title ??
+    text(properties.chunkId) ??
+    '未命名';
   const content = text(properties.content);
   return {
     id: nodeKey(label, properties),
@@ -338,7 +343,9 @@ function toNodeView(node: Node): GraphNodeView {
     title,
     index: integer(properties.index),
     contentPreview:
-      label === 'Chunk' && content ? content.slice(0, PREVIEW_LENGTH) : null,
+      label === 'Chunk' && content
+        ? readable(content.slice(0, PREVIEW_LENGTH))
+        : null,
     document: null,
   };
 }
@@ -353,7 +360,7 @@ function toRelationView(
   return {
     id: relation.elementId,
     type: relation.type,
-    name: semantic ?? relation.type,
+    name: decodeUploadedText(semantic ?? relation.type),
     source,
     target,
     documentId: text(properties.documentId),
@@ -374,6 +381,10 @@ function nodeKey(label: string, properties: Record<string, unknown>) {
 
 function text(value: unknown) {
   return typeof value === 'string' && value.length > 0 ? value : null;
+}
+
+function readable(value: string | null) {
+  return value ? decodeUploadedText(value) : null;
 }
 
 function integer(value: unknown) {
