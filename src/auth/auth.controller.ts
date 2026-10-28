@@ -9,6 +9,7 @@ import { RefreshDto } from './dto/refresh.dto.js';
 import { RegisterDto } from './dto/register.dto.js';
 import { ResetPasswordDto } from './dto/reset-password.dto.js';
 import { VerifyEmailDto } from './dto/verify-email.dto.js';
+import { UserPermissionService } from '../permission/user-permission.service.js';
 import { PasswordResetService } from './password-reset.service.js';
 import { Public } from './public.decorator.js';
 
@@ -19,6 +20,7 @@ export class AuthController {
     private readonly authService: AuthService,
     private readonly emailVerification: EmailVerificationService,
     private readonly passwordReset: PasswordResetService,
+    private readonly userPermissions: UserPermissionService,
   ) {}
 
   @Public()
@@ -62,10 +64,17 @@ export class AuthController {
     return this.authService.refresh(dto);
   }
 
-  /** 当前登录用户。令牌守卫已经查过库，这里直接返回。 */
+  /**
+   * 当前登录用户。
+   * permissionList 是启用角色上的权限和直接授予的权限合并后的列表。
+   */
   @Get('me')
-  me(@Req() request: Request & { user: UserProfile }) {
-    return request.user;
+  async me(@Req() request: Request & { user: UserProfile }) {
+    const merged = await this.userPermissions.listMerged(request.user.id);
+    return {
+      ...request.user,
+      permissionList: merged.permissions,
+    };
   }
 
   /** 文档审批员列表。账号启用，且绑定了启用中的审核员角色。 */

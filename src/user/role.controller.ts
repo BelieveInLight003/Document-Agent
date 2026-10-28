@@ -1,5 +1,7 @@
 import { Controller, Get } from '@nestjs/common';
 import { Roles } from '../auth/roles.decorator.js';
+import { PermissionCode } from '../permission/permission-code.js';
+import { Permissions } from '../permission/permissions.decorator.js';
 import { RoleCode } from './role-code.js';
 import { UserService } from './user.service.js';
 
@@ -9,6 +11,7 @@ export class RoleController {
   constructor(private readonly userService: UserService) {}
 
   @Roles(RoleCode.ADMIN)
+  @Permissions(PermissionCode.SYSTEM_ROLE)
   @Get()
   findAll() {
     return this.userService.listRoles();

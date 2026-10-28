@@ -4,6 +4,8 @@ import { ConfigModule, ConfigService } from '@nestjs/config';
 import { APP_GUARD } from '@nestjs/core';
 import { JwtModule, type JwtSignOptions } from '@nestjs/jwt';
 import { PassportModule } from '@nestjs/passport';
+import { PermissionModule } from '../permission/permission.module.js';
+import { PermissionsGuard } from '../permission/permission.guard.js';
 import { RedisModule } from '../redis/redis.module.js';
 import { UserModule } from '../user/user.module.js';
 import { AuthController } from './auth.controller.js';
@@ -17,6 +19,7 @@ import { RolesGuard } from './roles.guard.js';
 @Module({
   imports: [
     UserModule,
+    PermissionModule,
     RedisModule,
     PassportModule,
     MailerModule.forRootAsync({
@@ -64,9 +67,10 @@ import { RolesGuard } from './roles.guard.js';
     EmailVerificationService,
     PasswordResetService,
     JwtStrategy,
-    // 先校验令牌，再校验角色。APP_GUARD 对全部接口生效。
+    // 先校验令牌，再校验角色，最后校验权限。APP_GUARD 对全部接口生效。
     { provide: APP_GUARD, useClass: JwtAuthGuard },
     { provide: APP_GUARD, useClass: RolesGuard },
+    { provide: APP_GUARD, useClass: PermissionsGuard },
   ],
 })
 export class AuthModule {}

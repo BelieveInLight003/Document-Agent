@@ -12,6 +12,8 @@ import {
 } from '@nestjs/common';
 import type { Request } from 'express';
 import { Roles } from '../auth/roles.decorator.js';
+import { PermissionCode } from '../permission/permission-code.js';
+import { Permissions } from '../permission/permissions.decorator.js';
 import { AssignRolesDto } from './dto/assign-roles.dto.js';
 import { CreateUserDto } from './dto/create-user.dto.js';
 import { UpdateProfileDto } from './dto/update-profile.dto.js';
@@ -42,6 +44,7 @@ export class UserController {
 
   /** 管理员创建用户，可同时指定角色。 */
   @Roles(RoleCode.ADMIN)
+  @Permissions(PermissionCode.SYSTEM_USER)
   @Post()
   create(@Body() dto: CreateUserDto) {
     return this.userService.create(dto);
@@ -49,6 +52,7 @@ export class UserController {
 
   /** 管理员分页查询用户。 */
   @Roles(RoleCode.ADMIN)
+  @Permissions(PermissionCode.SYSTEM_USER)
   @Get()
   findAll(@Query() query: UserQueryDto) {
     return this.userService.findAll(query);
@@ -56,6 +60,7 @@ export class UserController {
 
   /** 管理员查看一个用户，含角色编码。 */
   @Roles(RoleCode.ADMIN)
+  @Permissions(PermissionCode.SYSTEM_USER)
   @Get(':id')
   findOne(@Param('id') id: string) {
     return this.userService.findOne(id);
@@ -63,6 +68,7 @@ export class UserController {
 
   /** 管理员修改用户。传入 roleCodes 会替换原角色。 */
   @Roles(RoleCode.ADMIN)
+  @Permissions(PermissionCode.SYSTEM_USER)
   @Patch(':id')
   update(@Param('id') id: string, @Body() dto: UpdateUserDto) {
     return this.userService.update(id, dto);
@@ -70,6 +76,7 @@ export class UserController {
 
   /** 管理员替换该用户的全部角色。 */
   @Roles(RoleCode.ADMIN)
+  @Permissions(PermissionCode.SYSTEM_USER)
   @Put(':id/roles')
   assignRoles(@Param('id') id: string, @Body() dto: AssignRolesDto) {
     return this.userService.assignRoles(id, dto.roleCodes);
@@ -77,6 +84,7 @@ export class UserController {
 
   /** 管理员软删除用户。不能删除自己。 */
   @Roles(RoleCode.ADMIN)
+  @Permissions(PermissionCode.SYSTEM_USER)
   @Delete(':id')
   remove(
     @Param('id') id: string,

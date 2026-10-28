@@ -5,6 +5,7 @@ import { AppService } from './app.service.js';
 import { DocumentModule } from './document/document.module.js';
 import { StorageModule } from './storage/storage.module.js';
 import { AuthModule } from './auth/auth.module.js';
+import { TeamModule } from './team/team.module.js';
 import { UserModule } from './user/user.module.js';
 
 export const { ObserveModule, ObserveInstrument } = createObserveModule();
@@ -21,6 +22,7 @@ export const { ObserveModule, ObserveInstrument } = createObserveModule();
     DocumentModule,
     StorageModule,
     UserModule,
+    TeamModule,
     AuthModule,
   ],
   controllers: [AppController],
