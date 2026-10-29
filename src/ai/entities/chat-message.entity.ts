@@ -9,6 +9,7 @@ import {
 } from 'typeorm';
 import { snowflake } from '../../document/snowflake.js';
 import type { HybridHitView } from '../ai.view.js';
+import type { ChatMessagePayload } from '../chat-step.js';
 import { bigintTransformer, ChatSession } from './chat-session.entity.js';
 
 @Entity('kh_chat_message')
@@ -33,7 +34,7 @@ export class ChatMessage {
   content: string;
 
   @Column({ type: 'jsonb', nullable: true })
-  payload: HybridHitView[] | null;
+  payload: HybridHitView[] | ChatMessagePayload | null;
 
   @CreateDateColumn({ name: 'created_at', type: 'timestamp' })
   createdAt: Date;

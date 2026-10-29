@@ -1,8 +1,10 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { DataSource, Repository } from 'typeorm';
 import { AiService } from './ai.service.js';
 import type { HybridHitView } from './ai.view.js';
+import { createAnswerStream } from './chat-stream.js';
+import type { ChatMessagePayload, ChatStep } from './chat-step.js';
 import { ChatMessage } from './entities/chat-message.entity.js';
 import { ChatSession } from './entities/chat-session.entity.js';
 
@@ -22,11 +24,14 @@ export type ChatMessageView = {
   role: 'user' | 'assistant';
   content: string;
   items: HybridHitView[] | null;
+  steps: ChatStep[] | null;
   createdAt: Date;
 };
 
 @Injectable()
 export class ChatSessionService {
+  private readonly logger = new Logger(ChatSessionService.name);
+
   constructor(
     @InjectRepository(ChatSession)
     private readonly sessionRepository: Repository<ChatSession>,
@@ -111,6 +116,42 @@ export class ChatSessionService {
     };
   }
 
+  /** 校验会话后返回 UI Message Stream。步骤、检索和回答都从这个流里推。 */
+  openStream(userId: string, id: string, question: string, limit?: number) {
+    const text = question.trim();
+    if (!text) {
+      throw new BadRequestException('问题不能为空');
+    }
+    return this.requireSession(userId, id).then((session) => {
+      const abort = new AbortController();
+      const stream = createAnswerStream({
+        question: text,
+        limit: limit ?? 5,
+        abortSignal: abort.signal,
+        retrieve: async (text, size) => {
+          const result = await this.aiService.retrieve({ question: text, limit: size });
+          return result.items;
+        },
+        onEnd: async (result) => {
+          try {
+            await this.saveTurn(session, {
+              question: text,
+              answer: result.answer,
+              items: result.items,
+              steps: result.steps,
+            });
+          } catch (error) {
+            this.logger.error(
+              '保存问答失败',
+              error instanceof Error ? error.stack : String(error),
+            );
+          }
+        },
+      });
+      return { stream, cancel: () => abort.abort() };
+    });
+  }
+
   private async messagesOf(sessionId: bigint) {
     const rows = await this.messageRepository.find({
       where: { sessionId },
@@ -132,6 +173,35 @@ export class ChatSessionService {
     return session;
   }
 
+  private async saveTurn(
+    session: ChatSession,
+    input: { question: string; answer: string; items: HybridHitView[]; steps: ChatStep[] },
+  ) {
+    await this.dataSource.transaction(async (manager) => {
+      await manager.save(
+        this.messageRepository.create({
+          sessionId: session.id,
+          role: 'user',
+          content: input.question,
+          payload: null,
+        }),
+      );
+      await manager.save(
+        this.messageRepository.create({
+          sessionId: session.id,
+          role: 'assistant',
+          content: input.answer,
+          payload: { items: input.items, steps: input.steps },
+        }),
+      );
+      if (session.title === DEFAULT_TITLE) {
+        session.title = input.question.slice(0, TITLE_LENGTH);
+      }
+      session.updatedAt = new Date();
+      await manager.save(session);
+    });
+  }
+
   private userKey(userId: string) {
     if (!/^\d+$/.test(userId)) {
       throw new NotFoundException('会话不存在');
@@ -150,12 +220,31 @@ function sessionView(session: ChatSession): ChatSessionView {
 }
 
 function messageView(message: ChatMessage): ChatMessageView {
+  const stored = readStored(message.payload);
   return {
     id: message.id.toString(),
     sessionId: message.sessionId.toString(),
     role: message.role,
     content: message.content,
-    items: Array.isArray(message.payload) ? message.payload : null,
+    items: stored.items,
+    steps: stored.steps,
     createdAt: message.createdAt,
+  };
+}
+
+function readStored(payload: ChatMessage['payload']): {
+  items: HybridHitView[] | null;
+  steps: ChatStep[] | null;
+} {
+  if (Array.isArray(payload)) {
+    return { items: payload, steps: null };
+  }
+  if (!payload || typeof payload !== 'object') {
+    return { items: null, steps: null };
+  }
+  const stored = payload as ChatMessagePayload;
+  return {
+    items: Array.isArray(stored.items) ? stored.items : null,
+    steps: Array.isArray(stored.steps) ? stored.steps : null,
   };
 }
