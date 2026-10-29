@@ -1,12 +1,12 @@
-import { createOpenAI } from '@ai-sdk/openai';
-import { ServiceUnavailableException } from '@nestjs/common';
 import {
   createUIMessageStream,
-  streamText,
   type UIMessage,
 } from 'ai';
 import type { HybridHitView } from './ai.view.js';
+import { createChatModel } from './chat-model.js';
 import type { ChatSource, ChatStep } from './chat-step.js';
+import type { ChatTrace } from './langsmith.js';
+import { tracedStreamText } from './langsmith.js';
 import { answerPrompt, UNANSWERABLE } from './prompt.js';
 
 type AnswerMessage = UIMessage<unknown, { step: ChatStep }>;
@@ -14,10 +14,21 @@ type AnswerMessage = UIMessage<unknown, { step: ChatStep }>;
 const ANSWER_PART = 'answer';
 
 export function createAnswerStream(input: {
+  /** 用户原话，用来展示和写入会话记录。 */
   question: string;
+  /** 拿去检索和回答的问题。指代不清时是改写后的句子。 */
+  searchQuestion: string;
+  /** 摘要加最近对话。没有上文时是空字符串。 */
+  memory: string;
+  /** 改写指代时用到的上下文，例如「上文」或「上文和长期记忆」。 */
+  contextLabel: string;
   limit: number;
   abortSignal: AbortSignal;
   retrieve: (question: string, limit: number) => Promise<HybridHitView[]>;
+  /** 和文档检索一起做。失败时应返回空文本，不要抛出。 */
+  recall: (question: string) => Promise<{ text: string; count: number }>;
+  /** 本次提问的 LangSmith 记录。没有密钥时是空实现。 */
+  trace: ChatTrace;
   onEnd: (result: {
     answer: string;
     items: HybridHitView[];
@@ -56,27 +67,38 @@ export function createAnswerStream(input: {
       writer.write({ type: 'start' });
       writer.write({ type: 'start-step' });
       const short = clip(input.question, 24);
+      const rewritten = input.searchQuestion !== input.question;
       publish({
         id: 'organize',
         kind: 'fold',
         title: `整理「${short}」`,
-        detail: '我先确认要查的对象和范围，再去知识库里找依据。',
+        detail: rewritten
+          ? `问题里的指代不清楚，已结合${input.contextLabel}改写为：${input.searchQuestion}`
+          : '我先确认要查的对象和范围，再去知识库里找依据。',
         status: 'done',
       });
       publish({
         id: 'search',
         kind: 'action',
-        title: `我将在知识库中检索「${input.question}」。`,
+        title: `我将在知识库中检索「${input.searchQuestion}」。`,
         status: 'running',
       });
 
+      let longTerm = '';
+      let longTermCount = 0;
       try {
-        items = await input.retrieve(input.question, input.limit);
+        const [found, recalled] = await Promise.all([
+          input.retrieve(input.searchQuestion, input.limit),
+          input.recall(input.searchQuestion),
+        ]);
+        items = found;
+        longTerm = recalled.text;
+        longTermCount = recalled.count;
       } catch {
         publish({
           id: 'search',
           kind: 'action',
-          title: `我将在知识库中检索「${input.question}」。`,
+          title: `我将在知识库中检索「${input.searchQuestion}」。`,
           status: 'done',
         });
         publish({
@@ -108,7 +130,8 @@ export function createAnswerStream(input: {
       publish({
         id: 'search',
         kind: 'action',
-        title: `我将在知识库中检索「${input.question}」。`,
+        title: `我将在知识库中检索「${input.searchQuestion}」。`,
+        detail: longTermCount > 0 ? `同时在长期记忆里找到 ${longTermCount} 条。` : undefined,
         status: 'done',
       });
       publish({
@@ -126,67 +149,86 @@ export function createAnswerStream(input: {
         kind: 'plan',
         title: '整理回答',
         detail:
-          items.length === 0
+          items.length === 0 && longTermCount === 0
             ? '知识库里没有能支撑回答的内容，我会直接说明。'
-            : `我将根据这 ${sources.length} 篇文档整理回答，并标出依据。`,
+            : items.length === 0
+              ? '知识库没有直接资料，我会只根据已确认的长期记忆回答。'
+              : `我将根据这 ${sources.length} 篇文档整理回答，并标出依据。`,
         status: 'done',
       });
       publish({ id: 'done', kind: 'done', title: '已完成', status: 'done' });
 
-      if (items.length === 0) {
+      if (items.length === 0 && longTermCount === 0) {
         writeText(UNANSWERABLE);
         finish('completed');
         return;
       }
 
       let started = false;
-      try {
-        const { instructions, prompt } = answerPrompt(input.question, items);
-        const result = streamText({
-          model: chatModel(),
-          system: instructions,
-          prompt,
-          temperature: 0,
-          abortSignal: input.abortSignal,
-        });
-        writer.write({ type: 'text-start', id: ANSWER_PART });
-        started = true;
-        for await (const delta of result.textStream) {
-          answer += delta;
-          writer.write({ type: 'text-delta', id: ANSWER_PART, delta });
-        }
-        if (!answer.trim()) {
-          answer = UNANSWERABLE;
-          writer.write({ type: 'text-delta', id: ANSWER_PART, delta: answer });
-        }
-        writer.write({ type: 'text-end', id: ANSWER_PART });
-      } catch (error) {
-        if (input.abortSignal.aborted || isAbort(error)) {
-          if (started) {
+      await input.trace.span(
+        '生成回答',
+        'llm',
+        {
+          question: input.searchQuestion,
+          documentCount: items.length,
+          longTermCount,
+        },
+        async () => {
+          try {
+            const { instructions, prompt } = answerPrompt(
+              input.searchQuestion,
+              items,
+              input.memory,
+              longTerm,
+            );
+            const result = tracedStreamText({
+              model: createChatModel(),
+              system: instructions,
+              prompt,
+              temperature: 0,
+              abortSignal: input.abortSignal,
+            });
+            writer.write({ type: 'text-start', id: ANSWER_PART });
+            started = true;
+            for await (const delta of result.textStream) {
+              answer += delta;
+              writer.write({ type: 'text-delta', id: ANSWER_PART, delta });
+            }
+            if (!answer.trim()) {
+              answer = UNANSWERABLE;
+              writer.write({ type: 'text-delta', id: ANSWER_PART, delta: answer });
+            }
             writer.write({ type: 'text-end', id: ANSWER_PART });
+          } catch (error) {
+            if (input.abortSignal.aborted || isAbort(error)) {
+              if (started) {
+                writer.write({ type: 'text-end', id: ANSWER_PART });
+              }
+              if (!answer.trim()) answer = '回答已中断。';
+              finish('aborted');
+              return answer;
+            }
+            if (!started) {
+              writeText('对话暂时不可用，请稍后再试。');
+            } else {
+              if (!answer.trim()) {
+                answer = '对话暂时不可用，请稍后再试。';
+                writer.write({ type: 'text-delta', id: ANSWER_PART, delta: answer });
+              }
+              writer.write({ type: 'text-end', id: ANSWER_PART });
+            }
           }
-          if (!answer.trim()) answer = '回答已中断。';
-          finish('aborted');
-          return;
-        }
-        if (!started) {
-          writeText('对话暂时不可用，请稍后再试。');
-        } else {
-          if (!answer.trim()) {
-            answer = '对话暂时不可用，请稍后再试。';
-            writer.write({ type: 'text-delta', id: ANSWER_PART, delta: answer });
-          }
-          writer.write({ type: 'text-end', id: ANSWER_PART });
-        }
-      }
-
-      finish(input.abortSignal.aborted ? 'aborted' : 'completed');
+          finish(input.abortSignal.aborted ? 'aborted' : 'completed');
+          return answer;
+        },
+        (text) => ({ answer: text }),
+      );
+      return;
     },
     onEnd: async ({ isAborted }) => {
       if (persisted) return;
       persisted = true;
       const content = answer.trim() || (isAborted ? '回答已中断。' : '');
-      if (!content) return;
       await input.onEnd({
         answer: content,
         items,
@@ -195,19 +237,6 @@ export function createAnswerStream(input: {
       });
     },
   });
-}
-
-function chatModel() {
-  const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) {
-    throw new ServiceUnavailableException('对话模型未配置');
-  }
-  const baseURL =
-    process.env.OPENAI_BASE_URL ??
-    process.env.EMBEDDING_BASE_URL ??
-    'https://dashscope.aliyuncs.com/compatible-mode/v1';
-  const name = process.env.CHAT_MODEL ?? 'qwen-plus';
-  return createOpenAI({ apiKey, baseURL }).chat(name);
 }
 
 function sourcesOf(items: HybridHitView[]): ChatSource[] {

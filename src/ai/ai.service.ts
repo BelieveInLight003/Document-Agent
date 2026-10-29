@@ -17,6 +17,7 @@ import { Document } from '../document/entities/document.entity.js';
 import { AskDto } from './dto/ask.dto.js';
 import { retrieveChunks } from './hybrid-retriever.js';
 import { chatMessages, UNANSWERABLE } from './prompt.js';
+import { hitTrace, insideTrace, startChatTrace } from './langsmith.js';
 import type { ChatResultView, HybridResultView } from './ai.view.js';
 
 const DEFAULT_LIMIT = 5;
@@ -36,32 +37,53 @@ export class AiService {
   /** 关键词加向量融合。不调用对话模型。结果只保留当前用户能读的已发布文档。 */
   async retrieve(viewer: DocumentViewer, dto: AskDto): Promise<HybridResultView> {
     const question = requiredQuestion(dto.question);
-    const items = await this.retrieveItems(
-      viewer,
-      question,
-      dto.limit ?? DEFAULT_LIMIT,
-    );
-    return { question, items };
+    if (insideTrace()) {
+      const items = await this.retrieveItems(viewer, question, dto.limit ?? DEFAULT_LIMIT);
+      return { question, items };
+    }
+    const trace = startChatTrace('文档检索', { question, limit: dto.limit ?? DEFAULT_LIMIT });
+    try {
+      const items = await this.retrieveItems(viewer, question, dto.limit ?? DEFAULT_LIMIT);
+      await trace.end(hitTrace(items));
+      return { question, items };
+    } catch (error) {
+      await trace.end({}, error);
+      throw error;
+    }
   }
 
   /** 先混合检索，再把命中的原文交给对话模型。没有资料时不调用模型。 */
   async chat(viewer: DocumentViewer, dto: AskDto): Promise<ChatResultView> {
     const question = requiredQuestion(dto.question);
-    const items = await this.retrieveItems(
-      viewer,
-      question,
-      dto.limit ?? DEFAULT_LIMIT,
-    );
-    if (items.length === 0) {
-      return { question, answer: UNANSWERABLE, items };
-    }
-
+    const limit = dto.limit ?? DEFAULT_LIMIT;
+    const trace = startChatTrace('直接问答', { question, limit });
     try {
-      const response = await createChat().invoke(chatMessages(question, items));
-      const answer = messageText(response.content).trim() || UNANSWERABLE;
+      const items = await trace.span(
+        '混合检索',
+        'retriever',
+        { question, limit },
+        () => this.retrieveItems(viewer, question, limit),
+        hitTrace,
+      );
+      if (items.length === 0) {
+        await trace.end({ answer: UNANSWERABLE, count: 0 });
+        return { question, answer: UNANSWERABLE, items };
+      }
+      const answer = await trace.span(
+        '生成回答',
+        'llm',
+        { question, count: items.length },
+        async () => {
+          const response = await createChat().invoke(chatMessages(question, items));
+          return messageText(response.content).trim() || UNANSWERABLE;
+        },
+        (text) => ({ answer: text }),
+      );
+      await trace.end({ answer, count: items.length });
       return { question, answer, items };
     } catch (error) {
-      if (error instanceof ServiceUnavailableException) {
+      await trace.end({}, error);
+      if (error instanceof ServiceUnavailableException || error instanceof BadRequestException) {
         throw error;
       }
       throw new ServiceUnavailableException('对话不可用');
