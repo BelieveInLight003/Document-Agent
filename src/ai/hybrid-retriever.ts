@@ -37,7 +37,7 @@ type ChunkSource = {
   content?: string;
 };
 
-/** 关键词和向量各查一路，按 chunkId 做倒数排名融合。索引不存在时返回空数组。 */
+/** 关键词和向量各查一路，按 chunkId 做倒数排名融合。索引不存在时返回空数组。阅读权限不在索引里判断，由调用方按文档记录过滤。 */
 export async function retrieveChunks(question: string, limit: number) {
   const target = getChunkIndexTarget();
   if (!target) {

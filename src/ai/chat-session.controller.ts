@@ -12,6 +12,7 @@ import {
 } from '@nestjs/common';
 import { pipeUIMessageStreamToResponse, type UIMessageChunk } from 'ai';
 import type { Request, Response } from 'express';
+import { documentViewer } from '../document/document-access.js';
 import { PermissionCode } from '../permission/permission-code.js';
 import { Permissions } from '../permission/permissions.decorator.js';
 import type { UserProfile } from '../user/user.service.js';
@@ -77,6 +78,7 @@ export class ChatSessionController {
         id,
         dto.question,
         dto.limit,
+        documentViewer(request.user),
       );
       const stop = () => cancel();
       response.on('close', stop);
@@ -107,6 +109,12 @@ export class ChatSessionController {
     @Param('id') id: string,
     @Body() dto: AskDto,
   ) {
-    return this.chatSessions.ask(request.user.id, id, dto.question, dto.limit);
+    return this.chatSessions.ask(
+      request.user.id,
+      id,
+      dto.question,
+      dto.limit,
+      documentViewer(request.user),
+    );
   }
 }

@@ -1,6 +1,7 @@
 import { BadRequestException, Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { DataSource, Repository } from 'typeorm';
+import type { DocumentViewer } from '../document/document-access.js';
 import { AiService } from './ai.service.js';
 import type { HybridHitView } from './ai.view.js';
 import { createAnswerStream } from './chat-stream.js';
@@ -79,10 +80,16 @@ export class ChatSessionService {
     return { id: session.id.toString() };
   }
 
-  /** 在会话里记一条提问，并保存这次混合检索的结果。 */
-  async ask(userId: string, id: string, question: string, limit?: number) {
+  /** 在会话里记一条提问，并保存这次混合检索的结果。检索按当前用户的文档权限过滤。 */
+  async ask(
+    userId: string,
+    id: string,
+    question: string,
+    limit: number | undefined,
+    viewer: DocumentViewer,
+  ) {
     const session = await this.requireSession(userId, id);
-    const result = await this.aiService.retrieve({ question, limit });
+    const result = await this.aiService.retrieve(viewer, { question, limit });
     const saved = await this.dataSource.transaction(async (manager) => {
       const userMessage = await manager.save(
         this.messageRepository.create({
@@ -116,8 +123,14 @@ export class ChatSessionService {
     };
   }
 
-  /** 校验会话后返回 UI Message Stream。步骤、检索和回答都从这个流里推。 */
-  openStream(userId: string, id: string, question: string, limit?: number) {
+  /** 校验会话后返回 UI Message Stream。步骤、检索和回答都从这个流里推，检索遵守文档权限。 */
+  openStream(
+    userId: string,
+    id: string,
+    question: string,
+    limit: number | undefined,
+    viewer: DocumentViewer,
+  ) {
     const text = question.trim();
     if (!text) {
       throw new BadRequestException('问题不能为空');
@@ -129,7 +142,7 @@ export class ChatSessionService {
         limit: limit ?? 5,
         abortSignal: abort.signal,
         retrieve: async (text, size) => {
-          const result = await this.aiService.retrieve({ question: text, limit: size });
+          const result = await this.aiService.retrieve(viewer, { question: text, limit: size });
           return result.items;
         },
         onEnd: async (result) => {

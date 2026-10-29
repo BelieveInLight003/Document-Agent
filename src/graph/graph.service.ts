@@ -11,6 +11,11 @@ import neo4j, {
   type Relationship,
 } from 'neo4j-driver';
 import { In, Repository } from 'typeorm';
+import {
+  filterReadableGraph,
+  toDocumentAccess,
+  type DocumentViewer,
+} from '../document/document-access.js';
 import { decodeUploadedText } from '../document/decode-uploaded-text.js';
 import { Document } from '../document/entities/document.entity.js';
 import { getNeo4jTarget } from '../pipelineManager/graph.js';
@@ -116,8 +121,8 @@ export class GraphService {
     private readonly documentRepository: Repository<Document>,
   ) {}
 
-  /** 命中节点后展开到所属文档、切片、实体和它们之间的关系。 */
-  async searchNodes(query: GraphNodeQueryDto): Promise<GraphView> {
+  /** 命中节点后展开到所属文档、切片、实体和它们之间的关系，再按文档权限裁剪。 */
+  async searchNodes(viewer: DocumentViewer, query: GraphNodeQueryDto): Promise<GraphView> {
     const keyword = requiredKeyword(query.keyword);
     const result = await this.run(NODE_CYPHER, {
       keyword,
@@ -126,11 +131,11 @@ export class GraphService {
       expansion: neo4j.int(EXPANSION_LIMIT),
     });
     const graph = readGraph(result, ['n1', 'n2', 'n3', 'n4'], ['r1', 'r2', 'r3']);
-    return this.overlayDocuments(graph);
+    return this.applyDocumentAccess(viewer, graph);
   }
 
-  /** 命中关系后补上两端节点，以及这条关系所属的文档和切片。 */
-  async searchRelations(query: GraphRelationQueryDto): Promise<GraphView> {
+  /** 命中关系后补上两端节点，以及这条关系所属的文档和切片，再按文档权限裁剪。 */
+  async searchRelations(viewer: DocumentViewer, query: GraphRelationQueryDto): Promise<GraphView> {
     const keyword = requiredKeyword(query.keyword);
     const result = await this.run(RELATION_CYPHER, {
       keyword,
@@ -142,7 +147,7 @@ export class GraphService {
       ['source', 'target', 'document', 'chunk', 'entity'],
       ['relation', 'hasChunk', 'mentions'],
     );
-    return this.overlayDocuments(graph);
+    return this.applyDocumentAccess(viewer, graph);
   }
 
   private async run(cypher: string, params: Record<string, unknown>) {
@@ -165,55 +170,68 @@ export class GraphService {
     }
   }
 
-  /** 文档节点用 Postgres 里的正文 id 和标题覆盖，保证和资料库一致。 */
-  private async overlayDocuments(graph: GraphView): Promise<GraphView> {
-    const ids = [
-      ...new Set(
-        graph.nodes.flatMap((node) =>
-          node.label === 'Document' &&
-          node.documentId &&
-          /^\d+$/.test(node.documentId)
-            ? [node.documentId]
-            : [],
-        ),
-      ),
-    ];
-    if (ids.length === 0) {
-      return graph;
-    }
-
-    const rows = await this.documentRepository.find({
-      where: { id: In(ids.map((id) => BigInt(id))), deleted: false },
-    });
+  /**
+   * 先按文档阅读权限去掉不能看的节点和边，再用 Postgres 标题覆盖剩下的文档节点。
+   * 库里没有对应文档时，这张图上的相关节点也不会留下。
+   */
+  private async applyDocumentAccess(viewer: DocumentViewer, graph: GraphView): Promise<GraphView> {
+    const ids = graphDocumentIds(graph);
+    const rows =
+      ids.length === 0
+        ? []
+        : await this.documentRepository.find({
+            where: { id: In(ids.map((id) => BigInt(id))), deleted: false },
+          });
+    const documents = new Map(rows.map((row) => [row.id.toString(), toDocumentAccess(row)]));
+    const visible = filterReadableGraph(graph, viewer, documents);
     const byId = new Map(rows.map((row) => [row.id.toString(), row]));
     return {
-      relations: graph.relations,
-      nodes: graph.nodes.map((node) => {
-        if (node.label !== 'Document' || !node.documentId) {
-          return node;
-        }
-        const row = byId.get(node.documentId);
-        if (!row) {
-          return node;
-        }
-        const title = decodeUploadedText(row.title);
-        const document: GraphDocumentBrief = {
-          id: row.id.toString(),
-          title,
-          contentId: row.contentId,
-          summary: row.summary ? decodeUploadedText(row.summary) : null,
-          status: row.status,
-        };
-        return {
-          ...node,
-          name: title,
-          title,
-          contentId: row.contentId,
-          document,
-        };
-      }),
+      relations: visible.relations,
+      nodes: visible.nodes.map((node) => overlayDocumentNode(node, byId)),
     };
   }
+}
+
+/** 节点和边上出现过的文档 id。不是数字的 id 对不上资料库，后面会当成不可读。 */
+function graphDocumentIds(graph: GraphView) {
+  const ids = new Set<string>();
+  for (const node of graph.nodes) {
+    if (node.documentId && /^\d+$/.test(node.documentId)) {
+      ids.add(node.documentId);
+    }
+  }
+  for (const relation of graph.relations) {
+    if (relation.documentId && /^\d+$/.test(relation.documentId)) {
+      ids.add(relation.documentId);
+    }
+  }
+  return [...ids];
+}
+
+/** 文档节点用 Postgres 里的正文 id 和标题覆盖，保证和资料库一致。 */
+function overlayDocumentNode(node: GraphNodeView, documents: Map<string, Document>) {
+  if (node.label !== 'Document' || !node.documentId) {
+    return node;
+  }
+  const row = documents.get(node.documentId);
+  if (!row) {
+    return node;
+  }
+  const title = decodeUploadedText(row.title);
+  const document: GraphDocumentBrief = {
+    id: row.id.toString(),
+    title,
+    contentId: row.contentId,
+    summary: row.summary ? decodeUploadedText(row.summary) : null,
+    status: row.status,
+  };
+  return {
+    ...node,
+    name: title,
+    title,
+    contentId: row.contentId,
+    document,
+  };
 }
 
 function requiredKeyword(keyword: string) {

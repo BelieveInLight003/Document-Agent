@@ -7,11 +7,16 @@ import {
 import { InjectRepository } from '@nestjs/typeorm';
 import { Client } from '@elastic/elasticsearch';
 import { In, Repository } from 'typeorm';
+import { canReadDocument, toDocumentAccess, type DocumentViewer } from '../document/document-access.js';
 import { Document } from '../document/entities/document.entity.js';
 import { getEsDocumentTarget } from '../pipelineManager/es-document.js';
 import { SearchQueryDto } from './dto/search-query.dto.js';
-import { searchDocumentView, type SearchResultView } from './search.view.js';
+import { searchDocumentView, type SearchHitView, type SearchResultView } from './search.view.js';
 
+/** 权限过滤会丢掉一部分命中，每批多取一些再筛，避免一页里全是看不到的文档。 */
+const ACCESS_BATCH = 40;
+/** Elasticsearch 允许的最大偏移。 */
+const MAX_WINDOW = 10000;
 /** 高亮文段条数，先固定 3 段。 */
 const HIGHLIGHT_SECTIONS = 3;
 /** 每一段大约截取的字数。 */
@@ -36,7 +41,8 @@ export class SearchService {
     private readonly documentRepository: Repository<Document>,
   ) {}
 
-  async search(query: SearchQueryDto): Promise<SearchResultView> {
+  /** 关键词检索后只保留当前用户能读的已发布文档。 */
+  async search(viewer: DocumentViewer, query: SearchQueryDto): Promise<SearchResultView> {
     const keyword = query.keyword.trim();
     if (!keyword) {
       throw new BadRequestException('关键词不能为空');
@@ -45,7 +51,7 @@ export class SearchService {
     const page = query.page ?? 1;
     const pageSize = query.pageSize ?? 10;
     const from = (page - 1) * pageSize;
-    if (from + pageSize > 10000) {
+    if (from + pageSize > MAX_WINDOW) {
       throw new BadRequestException('分页超出检索范围');
     }
 
@@ -54,16 +60,69 @@ export class SearchService {
       throw new ServiceUnavailableException('全文检索未启用');
     }
 
-    const result = await this.queryIndex(target.client, target.index, {
+    const readable = await this.collectReadable(viewer, target.client, target.index, {
       keyword,
-      from,
-      pageSize,
+      needed: from + pageSize,
     });
-    if (!result) {
-      return { total: 0, page, pageSize, list: [] };
-    }
+    return {
+      total: readable.total,
+      page,
+      pageSize,
+      list: readable.hits.slice(from, from + pageSize),
+    };
+  }
 
-    const hits = result.hits.hits;
+  /**
+   * 按批读取索引，筛掉不能读的文档，直到凑够当前页，或索引读完。
+   * 索引读完时 total 是实际能看的条数；还没读完时只保证当前页之后至少还有一页可翻。
+   */
+  private async collectReadable(
+    viewer: DocumentViewer,
+    client: Client,
+    index: string,
+    input: { keyword: string; needed: number },
+  ) {
+    const hits: SearchHitView[] = [];
+    let esFrom = 0;
+    let exhausted = false;
+    while (hits.length < input.needed && esFrom < MAX_WINDOW) {
+      const size = Math.min(ACCESS_BATCH, MAX_WINDOW - esFrom);
+      const result = await this.queryIndex(client, index, {
+        keyword: input.keyword,
+        from: esFrom,
+        pageSize: size,
+      });
+      if (!result) {
+        exhausted = true;
+        break;
+      }
+      const batch = result.hits.hits;
+      if (batch.length === 0) {
+        exhausted = true;
+        break;
+      }
+      hits.push(...(await this.readableHits(viewer, batch)));
+      esFrom += batch.length;
+      if (batch.length < size || esFrom >= readTotal(result.hits.total)) {
+        exhausted = true;
+        break;
+      }
+    }
+    return {
+      hits,
+      total: exhausted ? hits.length : Math.max(hits.length, input.needed + 1),
+    };
+  }
+
+  /** 一批索引命中里，留下已发布且当前用户有阅读权限的文档。 */
+  private async readableHits(
+    viewer: DocumentViewer,
+    hits: Array<{
+      _score?: number | null;
+      _source?: IndexedDocument;
+      highlight?: { content?: string[] };
+    }>,
+  ) {
     const contentIds = hits
       .map((hit) => hit._source?.contentId)
       .filter((contentId): contentId is string => Boolean(contentId));
@@ -73,32 +132,21 @@ export class SearchService {
         : await this.documentRepository.find({
             where: { contentId: In(contentIds), deleted: false },
           });
-    const documentMap = new Map(
-      documents.map((document) => [document.contentId, document]),
-    );
-
-    return {
-      total: readTotal(result.hits.total),
-      page,
-      pageSize,
-      list: hits.flatMap((hit) => {
-        const contentId = hit._source?.contentId;
-        const document = contentId ? documentMap.get(contentId) : undefined;
-        if (!document) {
-          return [];
-        }
-        return [
-          {
-            score: hit._score ?? null,
-            highlights: (hit.highlight?.content ?? []).slice(
-              0,
-              HIGHLIGHT_SECTIONS,
-            ),
-            document: searchDocumentView(document),
-          },
-        ];
-      }),
-    };
+    const documentMap = new Map(documents.map((document) => [document.contentId, document]));
+    return hits.flatMap((hit) => {
+      const contentId = hit._source?.contentId;
+      const document = contentId ? documentMap.get(contentId) : undefined;
+      if (!document || !canReadDocument(viewer, toDocumentAccess(document))) {
+        return [];
+      }
+      return [
+        {
+          score: hit._score ?? null,
+          highlights: (hit.highlight?.content ?? []).slice(0, HIGHLIGHT_SECTIONS),
+          document: searchDocumentView(document),
+        },
+      ];
+    });
   }
 
   /** 索引不存在时返回 null。连不上 Elasticsearch 时转为 503。 */
