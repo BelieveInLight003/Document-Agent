@@ -1,4 +1,4 @@
-/** 一条融合后的切片。channels 标出它来自关键词、向量，或两路都命中。 */
+/** 一条融合后的切片。channels 标出它来自关键词、向量、图谱或网页。网页条目用 url 打开原文。 */
 export type HybridHitView = {
   chunkId: string;
   documentId: string;
@@ -7,7 +7,8 @@ export type HybridHitView = {
   chapter: string | null;
   content: string;
   score: number;
-  channels: Array<'keyword' | 'vector'>;
+  channels: Array<'keyword' | 'vector' | 'graph' | 'web'>;
+  url?: string;
 };
 
 export type HybridResultView = {

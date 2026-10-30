@@ -9,5 +9,6 @@ import { GraphService } from './graph.service.js';
   imports: [TypeOrmModule.forFeature([Document])],
   controllers: [GraphController],
   providers: [GraphService],
+  exports: [GraphService],
 })
 export class GraphModule {}

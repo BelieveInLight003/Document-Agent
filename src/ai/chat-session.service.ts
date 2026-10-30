@@ -2,6 +2,7 @@ import { BadRequestException, Injectable, Logger, NotFoundException } from '@nes
 import { InjectRepository } from '@nestjs/typeorm';
 import { DataSource, Repository } from 'typeorm';
 import type { DocumentViewer } from '../document/document-access.js';
+import { GraphService } from '../graph/graph.service.js';
 import { AiService } from './ai.service.js';
 import type { HybridHitView } from './ai.view.js';
 import { ChatMemoryService } from './chat-memory.service.js';
@@ -12,6 +13,8 @@ import { ChatMessage } from './entities/chat-message.entity.js';
 import { ChatSession } from './entities/chat-session.entity.js';
 import { formatLongTerm } from './mem0-memory.js';
 import { Mem0MemoryService } from './mem0-memory.service.js';
+import { graphKeyword, graphPassages } from './graph-passages.js';
+import { searchBocha } from './bocha-search.js';
 import { hitTrace, startChatTrace } from './langsmith.js';
 
 const DEFAULT_TITLE = '新会话';
@@ -46,6 +49,7 @@ export class ChatSessionService {
     private readonly aiService: AiService,
     private readonly memory: ChatMemoryService,
     private readonly longTerm: Mem0MemoryService,
+    private readonly graphService: GraphService,
     private readonly dataSource: DataSource,
   ) {}
 
@@ -215,6 +219,35 @@ export class ChatSessionService {
                 });
                 return result.items;
               },
+              hitTrace,
+            ),
+          retrieveGraph: (searchText, size) =>
+            trace.span(
+              '图谱检索',
+              'retriever',
+              { query: searchText, limit: size },
+              async () => {
+                const view = await this.graphService.searchNodes(viewer, {
+                  keyword: searchText,
+                  limit: size,
+                });
+                const passages = graphPassages(view, size);
+                const shorter = graphKeyword(searchText);
+                if (passages.length > 0 || !shorter || shorter === searchText.trim()) return passages;
+                const again = await this.graphService.searchNodes(viewer, {
+                  keyword: shorter,
+                  limit: size,
+                });
+                return graphPassages(again, size);
+              },
+              hitTrace,
+            ),
+          retrieveWeb: (searchText, size) =>
+            trace.span(
+              '联网检索',
+              'retriever',
+              { query: searchText, limit: size },
+              () => searchBocha(searchText, size, abort.signal),
               hitTrace,
             ),
           recall: (query) =>
