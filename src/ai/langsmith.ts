@@ -5,17 +5,25 @@ import { RunTree } from 'langsmith/run_trees';
 import { getCurrentRunTree, withRunTree } from 'langsmith/traceable';
 import { wrapAISDK } from 'langsmith/experimental/vercel';
 import type { HybridHitView } from './ai.view.js';
+import {
+  enableLangfuse,
+  insideLangfuseTrace,
+  openLangfuseTrace,
+  runLangfuseSpan,
+  type LangfuseTrace,
+} from './langfuse.js';
 
 /**
  * 查找链路的 LangSmith 追踪。
  *
  * 一条用户提问对应一条 chain。下面挂整理问题、文档检索、长期记忆检索、生成回答。
- * 模型调用会再挂在当前步骤下面，提示词和输出可以在 LangSmith 里展开。
- * 没有 LANGSMITH_API_KEY 时全部退回普通函数，问答不受影响。
+ * 同一条链路也会写入 Langfuse。模型调用挂在当前步骤下面。
+ * 没有对应密钥时退回普通函数，问答不受影响。
  */
 
 loadEnvFile();
 const tracing = enableLangSmith();
+enableLangfuse();
 
 const traced = wrapAISDK(
   { generateText, streamText, wrapLanguageModel },
@@ -64,12 +72,8 @@ export function startChatTrace(
   inputs: Record<string, unknown>,
   metadata: Record<string, unknown> = {},
 ): ChatTrace {
-  if (!tracing) {
-    return {
-      span: (_name, _runType, _inputs, fn) => fn(),
-      end: async () => undefined,
-    };
-  }
+  const fuse = openLangfuseTrace(name, inputs, metadata);
+  if (!tracing) return fuse ? langfuseTrace(fuse) : emptyTrace();
   const root = new RunTree({
     name,
     run_type: 'chain',
@@ -82,6 +86,7 @@ export function startChatTrace(
   let ended = false;
   return {
     async span(step, runType, stepInputs, fn, outputs) {
+      const exec = () => (fuse ? runLangfuseSpan(fuse.ctx, step, runType, stepInputs, fn, outputs) : fn());
       let child: RunTree;
       try {
         await opened;
@@ -94,10 +99,10 @@ export function startChatTrace(
         await child.postRun();
       } catch (error) {
         report(error);
-        return fn();
+        return exec();
       }
       try {
-        const value = await withRunTree(child, fn);
+        const value = await withRunTree(child, exec);
         await child.end(outputs(value));
         await child.patchRun();
         return value;
@@ -122,14 +127,32 @@ export function startChatTrace(
       } catch (reportError) {
         report(reportError);
       }
+      await fuse?.finish(outputs, error);
     },
   };
 }
 
-/** 已经在某条 trace 里时，不要再开一条根记录，否则同一次检索会在 LangSmith 里出现两遍。 */
+function langfuseTrace(fuse: LangfuseTrace): ChatTrace {
+  return {
+    span: (step, runType, stepInputs, fn, outputs) =>
+      runLangfuseSpan(fuse.ctx, step, runType, stepInputs, fn, outputs),
+    async end(outputs, error) {
+      await fuse.finish(outputs, error);
+    },
+  };
+}
+
+function emptyTrace(): ChatTrace {
+  return {
+    span: (_name, _runType, _inputs, fn) => fn(),
+    end: async () => undefined,
+  };
+}
+
+/** 已经在某条 trace 里时，不要再开一条根记录，否则同一次检索会记两遍。 */
 export function insideTrace() {
-  if (!tracing) return false;
-  return Boolean(getCurrentRunTree(true));
+  if (tracing && getCurrentRunTree(true)) return true;
+  return insideLangfuseTrace();
 }
 
 /**
