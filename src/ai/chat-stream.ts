@@ -266,7 +266,8 @@ export function createAnswerStream(input: {
   });
 }
 
-function promptOf(
+/** 按决策结果选提示词。评测和线上回答共用这一套，避免两边各写一份。 */
+export function promptOf(
   outcome: string,
   question: string,
   items: HybridHitView[],
@@ -297,7 +298,8 @@ function planDetail(outcome: string, items: HybridHitView[]) {
   return `资料已评估为切题，我将根据 ${items.length} 条资料回答，并标出 [n]。`;
 }
 
-function refuseCopy(reason: 'knowledge' | 'web-insufficient' | 'web-unavailable' | 'web-off' | undefined) {
+/** 知识库或联网不够时的固定句子。评测用同一句，才能判断拒答是否正确。 */
+export function refuseCopy(reason: 'knowledge' | 'web-insufficient' | 'web-unavailable' | 'web-off' | undefined) {
   if (reason === 'web-unavailable') {
     return { detail: '联网检索暂时不可用，我会直接说明。', text: '联网检索暂时不可用，请稍后再试。' };
   }

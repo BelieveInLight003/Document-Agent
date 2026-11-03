@@ -48,6 +48,9 @@ lerna-debug.log*
 .temp
 .tmp
 
+# 离线评测写在本地的结果，不提交
+/eval-reports
+
 # Runtime data
 pids
 *.pid
