@@ -1,15 +1,32 @@
 import { inflateRawSync } from 'node:zlib';
 
-/** 读取 Office Open XML（docx / xlsx / pptx）这类 zip 包里的文件。 */
+/** 读取 Office Open XML（docx / xlsx / pptx）这类 zip 包里的文本文件。 */
 export function readZip(buffer: Buffer) {
+  const files = new Map<string, string>();
+  for (const [name, data] of readZipEntries(buffer)) {
+    files.set(name, data.toString('utf8'));
+  }
+  return files;
+}
+
+/** 读取 zip 里的原始字节，给 MinerU 导出的图片用。 */
+export function readZipBytes(buffer: Buffer) {
+  const files = new Map<string, Buffer>();
+  for (const [name, data] of readZipEntries(buffer)) {
+    files.set(name, data);
+  }
+  return files;
+}
+
+function readZipEntries(buffer: Buffer) {
   const eocd = findEocd(buffer);
   if (eocd < 0) {
-    throw new Error('不是有效的 Office 压缩文件');
+    throw new Error('不是有效的压缩文件');
   }
 
   const count = buffer.readUInt16LE(eocd + 10);
   let offset = buffer.readUInt32LE(eocd + 16);
-  const files = new Map<string, string>();
+  const files: Array<[string, Buffer]> = [];
 
   for (let index = 0; index < count; index += 1) {
     if (offset + 46 > buffer.length || buffer.readUInt32LE(offset) !== 0x02014b50) {
@@ -22,9 +39,7 @@ export function readZip(buffer: Buffer) {
     const extraLength = buffer.readUInt16LE(offset + 30);
     const commentLength = buffer.readUInt16LE(offset + 32);
     const localOffset = buffer.readUInt32LE(offset + 42);
-    const name = buffer
-      .subarray(offset + 46, offset + 46 + nameLength)
-      .toString('utf8');
+    const name = buffer.subarray(offset + 46, offset + 46 + nameLength).toString('utf8');
 
     if (!name.endsWith('/') && localOffset + 30 <= buffer.length) {
       const localNameLength = buffer.readUInt16LE(localOffset + 26);
@@ -33,11 +48,13 @@ export function readZip(buffer: Buffer) {
       const compressed = buffer.subarray(dataStart, dataStart + compressedSize);
       const data =
         method === 0
-          ? compressed
+          ? Buffer.from(compressed)
           : method === 8
             ? inflateRawSync(compressed)
             : Buffer.alloc(0);
-      files.set(name, data.toString('utf8'));
+      if (data.length > 0) {
+        files.push([name, data]);
+      }
     }
 
     offset += 46 + nameLength + extraLength + commentLength;

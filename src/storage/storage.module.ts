@@ -4,7 +4,7 @@
  * 知识库把一篇文档拆在三个地方：
  * - PostgreSQL `kh_document`：标题、分类、作者等元数据
  * - MongoDB `document_content`：正文
- * - RustFS：pdf / docx / xlsx 等源文件本身
+ * - RustFS：pdf / docx / xlsx 等源文件，以及解析出的文档图片
  *
  * 本模块只负责第三块。RustFS 兼容 S3，接口在 9000，网页控制台在 9001。
  * 连接信息来自 `.env` 的 `RUSTFS_*`。`RustfsService` 已导出，文档模块以后可以直接注入，

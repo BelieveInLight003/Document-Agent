@@ -10,7 +10,7 @@ import { Model, Types } from 'mongoose';
 import path from 'node:path';
 import { Repository } from 'typeorm';
 import { decodeUploadedText } from './decode-uploaded-text.js';
-import { detectParser, parseToMarkdown } from '../parser/index.js';
+import { detectParser, parseToMarkdown, replaceImageRefs, type ParsedImage } from '../parser/index.js';
 import { PipelineManagerService } from '../pipelineManager/pipeline-manager.service.js';
 import { RustfsService, type SourceFile } from '../storage/rustfs.service.js';
 import { DocumentStatus } from './document-status.js';
@@ -154,7 +154,8 @@ export class DocumentService implements OnModuleInit {
       );
     }
 
-    const markdown = (await parseToMarkdown(parser, file.buffer)).trim();
+    const parsed = await parseToMarkdown(parser, file.buffer);
+    const markdown = (await this.mountImages(parsed.markdown, parsed.images)).trim();
     if (!markdown) {
       throw new BadRequestException('文件内容为空');
     }
@@ -176,6 +177,23 @@ export class DocumentService implements OnModuleInit {
       createBy: parseUploadDto.createBy,
       sourceFile: namedFile,
     });
+  }
+
+  /** 文档图片上传到 RustFS，Markdown 里的相对路径换成可访问链接。 */
+  private async mountImages(markdown: string, images: ParsedImage[]) {
+    const urls = new Map<string, string>();
+    for (const image of images) {
+      if (urls.has(image.ref)) {
+        continue;
+      }
+      const uploaded = await this.rustfsService.uploadDocumentImage({
+        filename: image.filename,
+        buffer: image.data,
+        contentType: image.contentType,
+      });
+      urls.set(image.ref, uploaded.url);
+    }
+    return replaceImageRefs(markdown, urls);
   }
 
   /** 拿到 Markdown 后，只在这里写入 RustFS、MongoDB 和 PostgreSQL。 */

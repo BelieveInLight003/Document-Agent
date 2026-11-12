@@ -1,11 +1,6 @@
-import { extractText, getDocumentProxy } from 'unpdf';
+import { parseWithMineru } from './mineru.js';
 
-/** 抽出 PDF 里的文字，按页拼成 Markdown。扫描件没有文字层时结果为空。 */
-export async function parsePdf(buffer: Buffer) {
-  const pdf = await getDocumentProxy(new Uint8Array(buffer));
-  const { text } = await extractText(pdf, { mergePages: false });
-  const pages = (Array.isArray(text) ? text : [text])
-    .map((page) => page.trim())
-    .filter(Boolean);
-  return pages.join('\n\n');
+/** 把 PDF 交给 MinerU。扫描件、表格和多栏都由它处理。 */
+export function parsePdf(buffer: Buffer) {
+  return parseWithMineru(buffer, 'pdf');
 }

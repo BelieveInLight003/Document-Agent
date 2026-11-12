@@ -2,7 +2,7 @@
  * RustFS 客户端。
  *
  * 用 AWS Signature V4 直接请求 S3 兼容接口，不额外依赖 AWS SDK。
- * 上传路径形如 `sources/年/月/{uuid}-{文件名}`，避免重名覆盖。
+ * 源文件路径形如 `sources/年/月/{uuid}-{文件名}`，文档图片是 `images/年/月/{uuid}-{文件名}`。
  * 第一次上传时会检查桶 `RUSTFS_BUCKET`（默认 `knowledge-hub`），不存在就创建。
  *
  * 配置项：
@@ -66,24 +66,50 @@ export class RustfsService {
   }
 
   /** 把文档源文件写入 RustFS，并返回对象键与访问地址。 */
-  async uploadSourceFile(file: SourceFile): Promise<UploadedSourceFile> {
+  uploadSourceFile(file: SourceFile) {
+    return this.uploadObject({
+      filename: file?.originalname,
+      buffer: file?.buffer,
+      contentType: file?.mimetype || 'application/octet-stream',
+      folder: 'sources',
+      emptyMessage: '请上传文档源文件',
+    });
+  }
+
+  /** 把解析出的文档图片写入 RustFS。返回的 url 写回 Markdown。 */
+  uploadDocumentImage(file: { filename: string; buffer: Buffer; contentType: string }) {
+    return this.uploadObject({
+      filename: file.filename,
+      buffer: file.buffer,
+      contentType: file.contentType || 'application/octet-stream',
+      folder: 'images',
+      emptyMessage: '文档图片为空',
+    });
+  }
+
+  private async uploadObject(input: {
+    filename?: string;
+    buffer?: Buffer;
+    contentType: string;
+    folder: 'sources' | 'images';
+    emptyMessage: string;
+  }): Promise<UploadedSourceFile> {
     if (!this.enabled) {
       throw new ServiceUnavailableException('RustFS 未启用');
     }
-    if (!file?.buffer?.length) {
-      throw new BadRequestException('请上传文档源文件');
+    const body = input.buffer;
+    if (!body || body.length === 0) {
+      throw new BadRequestException(input.emptyMessage);
     }
 
     await this.ensureBucket();
 
-    const filename = this.safeFilename(file.originalname);
-    const key = this.buildKey(filename);
-    const contentType = file.mimetype || 'application/octet-stream';
-
-    const response = await this.request('PUT', key, file.buffer, contentType);
+    const filename = this.safeFilename(input.filename ?? 'file');
+    const key = this.buildKey(input.folder, filename);
+    const response = await this.request('PUT', key, body, input.contentType);
     if (!response.ok) {
       throw new ServiceUnavailableException(
-        `源文件上传到 RustFS 失败：${response.status} ${await this.errorText(response)}`,
+        `文件上传到 RustFS 失败：${response.status} ${await this.errorText(response)}`,
       );
     }
 
@@ -91,9 +117,9 @@ export class RustfsService {
       bucket: this.bucket,
       key,
       url: this.publicUrl(key),
-      size: file.size || file.buffer.length,
+      size: body.length,
       filename,
-      contentType,
+      contentType: input.contentType,
     };
   }
 
@@ -194,11 +220,11 @@ export class RustfsService {
     return `/${bucket}/${key.split('/').map(encodeRfc3986).join('/')}`;
   }
 
-  private buildKey(filename: string) {
+  private buildKey(folder: 'sources' | 'images', filename: string) {
     const now = new Date();
     const year = now.getFullYear();
     const month = String(now.getMonth() + 1).padStart(2, '0');
-    return `sources/${year}/${month}/${randomUUID()}-${filename}`;
+    return `${folder}/${year}/${month}/${randomUUID()}-${filename}`;
   }
 
   private safeFilename(originalname: string) {
