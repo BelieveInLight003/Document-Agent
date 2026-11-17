@@ -6,6 +6,7 @@ import { Permissions } from '../permission/permissions.decorator.js';
 import type { UserProfile } from '../user/user.service.js';
 import { AiService } from './ai.service.js';
 import { AskDto } from './dto/ask.dto.js';
+import { AgentRuntime } from './agent-runtime.js';
 
 /** 混合检索和基于资料的对话。需要登录，以及搜索权限。检索结果再按文档阅读权限过滤。 */
 @Controller('ai')
@@ -15,13 +16,34 @@ export class AiController {
 
   /** 关键词与向量融合，返回当前用户能读的已发布切片，不生成回答。 */
   @Post('retrieve')
-  retrieve(@Req() request: Request & { user: UserProfile }, @Body() dto: AskDto) {
-    return this.aiService.retrieve(documentViewer(request.user), dto);
+  retrieve(
+    @Req() request: Request & { user: UserProfile },
+    @Body() dto: AskDto,
+  ) {
+    return this.run(request, () =>
+      this.aiService.retrieve(documentViewer(request.user), dto),
+    );
   }
 
   /** 用混合检索结果作为上下文，让对话模型作答。看不到的文档不会进入上下文。 */
   @Post('chat')
   chat(@Req() request: Request & { user: UserProfile }, @Body() dto: AskDto) {
-    return this.aiService.chat(documentViewer(request.user), dto);
+    return this.run(request, () =>
+      this.aiService.chat(documentViewer(request.user), dto),
+    );
+  }
+
+  private async run<T>(request: Request, action: () => Promise<T>) {
+    const abort = new AbortController();
+    const stop = () => {
+      if (!request.res?.writableFinished) abort.abort();
+    };
+    request.res?.on('close', stop);
+    if (request.res?.destroyed) abort.abort();
+    try {
+      return await new AgentRuntime(abort.signal).run(action);
+    } finally {
+      request.res?.off('close', stop);
+    }
   }
 }

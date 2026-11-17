@@ -1,7 +1,4 @@
-import {
-  createUIMessageStream,
-  type UIMessage,
-} from 'ai';
+import { createUIMessageStream, type UIMessage } from 'ai';
 import { runAgentLoop } from './agent-loop.js';
 import { citedItems, citedSources } from './agent-grade.js';
 import type { HybridHitView } from './ai.view.js';
@@ -9,7 +6,13 @@ import { createChatModel } from './chat-model.js';
 import type { ChatStep } from './chat-step.js';
 import type { ChatTrace } from './langsmith.js';
 import { tracedStreamText } from './langsmith.js';
-import { answerPrompt, chatPrompt, preferencePrompt, UNANSWERABLE } from './prompt.js';
+import {
+  answerPrompt,
+  chatPrompt,
+  preferencePrompt,
+  UNANSWERABLE,
+} from './prompt.js';
+import { AgentRuntime } from './agent-runtime.js';
 
 type AnswerMessage = UIMessage<unknown, { step: ChatStep }>;
 
@@ -26,6 +29,7 @@ export function createAnswerStream(input: {
   contextLabel: string;
   limit: number;
   abortSignal: AbortSignal;
+  runtime?: AgentRuntime;
   retrieve: (question: string, limit: number) => Promise<HybridHitView[]>;
   /** 知识图谱。失败时应抛出，决策链会记成图谱不可用并继续用文档结果。 */
   retrieveGraph: (question: string, limit: number) => Promise<HybridHitView[]>;
@@ -40,229 +44,324 @@ export function createAnswerStream(input: {
     items: HybridHitView[];
     steps: ChatStep[];
     aborted: boolean;
+    status: 'completed' | 'failed' | 'aborted';
   }) => Promise<void>;
 }) {
   const steps: ChatStep[] = [];
   let items: HybridHitView[] = [];
   let answer = '';
   let persisted = false;
+  let failed = false;
+  const runtime = input.runtime ?? new AgentRuntime(input.abortSignal);
 
   return createUIMessageStream<AnswerMessage>({
-    execute: async ({ writer }) => {
-      const publish = (step: ChatStep) => {
-        const index = steps.findIndex((item) => item.id === step.id);
-        if (index >= 0) steps[index] = step;
-        else steps.push(step);
-        writer.write({ type: 'data-step', id: step.id, data: step });
-      };
-      const writeText = (text: string) => {
-        answer = text;
-        writer.write({ type: 'text-start', id: ANSWER_PART });
-        writer.write({ type: 'text-delta', id: ANSWER_PART, delta: text });
-        writer.write({ type: 'text-end', id: ANSWER_PART });
-      };
-      const finish = (status: 'completed' | 'aborted') => {
-        writer.setOutcome(status === 'aborted' ? { status: 'aborted' } : { status: 'completed' });
-        writer.write({ type: 'finish-step' });
-        writer.write({
-          type: 'finish',
-          finishReason: status === 'aborted' ? 'interrupted' : 'stop',
-        });
-      };
-      const generate = async (instructions: string, prompt: string, span: Record<string, unknown>) => {
-        let started = false;
-        let aborted = false;
-        await input.trace.span(
-          '生成回答',
-          'llm',
-          span,
-          async () => {
-            try {
-              const result = tracedStreamText({
-                model: createChatModel(),
-                system: instructions,
-                prompt,
-                temperature: 0,
-                abortSignal: input.abortSignal,
-              });
-              writer.write({ type: 'text-start', id: ANSWER_PART });
-              started = true;
-              for await (const delta of result.textStream) {
-                answer += delta;
-                writer.write({ type: 'text-delta', id: ANSWER_PART, delta });
-              }
-              if (!answer.trim()) {
-                answer = UNANSWERABLE;
-                writer.write({ type: 'text-delta', id: ANSWER_PART, delta: answer });
-              }
-              writer.write({ type: 'text-end', id: ANSWER_PART });
-            } catch (error) {
-              if (input.abortSignal.aborted || isAbort(error)) {
-                aborted = true;
-                if (started) writer.write({ type: 'text-end', id: ANSWER_PART });
-                if (!answer.trim()) answer = '回答已中断。';
-                return answer;
-              }
-              if (!started) {
-                writeText('对话暂时不可用，请稍后再试。');
-              } else {
+    onError: () => {
+      failed = true;
+      if (!answer.trim()) answer = '对话暂时不可用，请稍后再试。';
+      return '对话暂时不可用，请稍后再试。';
+    },
+    execute: async ({ writer }) =>
+      runtime.run(async () => {
+        const publish = (step: ChatStep) => {
+          const index = steps.findIndex((item) => item.id === step.id);
+          if (index >= 0) steps[index] = step;
+          else steps.push(step);
+          writer.write({ type: 'data-step', id: step.id, data: step });
+        };
+        const writeText = (text: string) => {
+          answer = text;
+          writer.write({ type: 'text-start', id: ANSWER_PART });
+          writer.write({ type: 'text-delta', id: ANSWER_PART, delta: text });
+          writer.write({ type: 'text-end', id: ANSWER_PART });
+        };
+        const finish = (status: 'completed' | 'aborted') => {
+          writer.setOutcome(
+            status === 'aborted'
+              ? { status: 'aborted' }
+              : failed
+                ? {
+                    status: 'failed',
+                    error: new Error('Agent execution failed'),
+                  }
+                : { status: 'completed' },
+          );
+          writer.write({ type: 'finish-step' });
+          writer.write({
+            type: 'finish',
+            finishReason: status === 'aborted' ? 'interrupted' : 'stop',
+          });
+        };
+        const generate = async (
+          instructions: string,
+          prompt: string,
+          span: Record<string, unknown>,
+        ) => {
+          let started = false;
+          let aborted = false;
+          await input.trace.span(
+            '生成回答',
+            'llm',
+            span,
+            async () => {
+              try {
+                const result = tracedStreamText({
+                  model: createChatModel(),
+                  system: instructions,
+                  prompt,
+                  temperature: 0,
+                  abortSignal: input.abortSignal,
+                  maxOutputTokens: 2_048,
+                });
+                writer.write({ type: 'text-start', id: ANSWER_PART });
+                started = true;
+                for await (const part of result.fullStream) {
+                  if (part.type === 'error') throw part.error;
+                  if (part.type === 'abort')
+                    throw new DOMException('Aborted', 'AbortError');
+                  if (part.type !== 'text-delta') continue;
+                  answer += part.text;
+                  writer.write({
+                    type: 'text-delta',
+                    id: ANSWER_PART,
+                    delta: part.text,
+                  });
+                }
+                if (runtime.signal.aborted) throw runtime.signal.reason;
                 if (!answer.trim()) {
-                  answer = '对话暂时不可用，请稍后再试。';
-                  writer.write({ type: 'text-delta', id: ANSWER_PART, delta: answer });
+                  answer = UNANSWERABLE;
+                  writer.write({
+                    type: 'text-delta',
+                    id: ANSWER_PART,
+                    delta: answer,
+                  });
                 }
                 writer.write({ type: 'text-end', id: ANSWER_PART });
+              } catch (error) {
+                if (
+                  runtime.signal.aborted ||
+                  input.abortSignal.aborted ||
+                  isAbort(error)
+                ) {
+                  aborted = true;
+                  if (started)
+                    writer.write({ type: 'text-end', id: ANSWER_PART });
+                  if (!answer.trim()) answer = '回答已中断。';
+                  return answer;
+                }
+                failed = true;
+                if (!started) {
+                  writeText('对话暂时不可用，请稍后再试。');
+                } else {
+                  if (!answer.trim()) {
+                    answer = '对话暂时不可用，请稍后再试。';
+                    writer.write({
+                      type: 'text-delta',
+                      id: ANSWER_PART,
+                      delta: answer,
+                    });
+                  }
+                  writer.write({ type: 'text-end', id: ANSWER_PART });
+                }
               }
-            }
-            return answer;
+              return answer;
+            },
+            (text) => ({ answer: text }),
+          );
+          return aborted;
+        };
+
+        writer.write({ type: 'start' });
+        writer.write({ type: 'start-step' });
+        const short = clip(input.question, 24);
+        const rewritten = input.searchQuestion !== input.question;
+        publish({
+          id: 'organize',
+          kind: 'fold',
+          title: `整理「${short}」`,
+          detail: rewritten
+            ? `问题里的指代不清楚，已结合${input.contextLabel}改写为：${input.searchQuestion}`
+            : '我先确认要查的对象和范围。',
+          status: 'done',
+        });
+
+        let longTerm = '';
+        try {
+          const recalled = await input.recall(input.searchQuestion);
+          longTerm = recalled.text;
+        } catch {
+          longTerm = '';
+        }
+        if (runtime.signal.aborted) {
+          answer = '回答已中断。';
+          finish('aborted');
+          return;
+        }
+
+        const loop = await runAgentLoop({
+          question: input.searchQuestion,
+          memory: input.memory,
+          longTerm,
+          limit: input.limit,
+          signal: runtime.signal,
+          trace: input.trace,
+          retrieve: input.retrieve,
+          retrieveGraph: input.retrieveGraph,
+          retrieveWeb: input.retrieveWeb,
+          onStep: publish,
+        });
+        if (loop.outcome === 'aborted') {
+          answer = '回答已中断。';
+          finish('aborted');
+          return;
+        }
+        if (loop.outcome === 'unavailable') {
+          failed = true;
+          publish({
+            id: 'sources',
+            kind: 'sources',
+            title: '检索失败',
+            detail: '检索或评估暂时不可用。',
+            status: 'done',
+            sources: [],
+          });
+          publish({
+            id: 'done',
+            kind: 'done',
+            title: '已完成',
+            status: 'done',
+          });
+          writeText('检索或评估暂时不可用，请稍后再试。');
+          finish('completed');
+          return;
+        }
+        if (
+          loop.outcome === 'refuse' ||
+          (loop.outcome === 'answer' && loop.items.length === 0)
+        ) {
+          if (loop.refuseReason === 'web-unavailable') failed = true;
+          const refused = refuseCopy(loop.refuseReason);
+          publish({
+            id: 'plan',
+            kind: 'plan',
+            title: '整理回答',
+            detail: refused.detail,
+            status: 'done',
+          });
+          publish({
+            id: 'sources',
+            kind: 'sources',
+            title: '没有可引用的资料',
+            detail: '评估没有通过的资料不会展示。',
+            status: 'done',
+            sources: [],
+          });
+          publish({
+            id: 'done',
+            kind: 'done',
+            title: '已完成',
+            status: 'done',
+          });
+          writeText(refused.text);
+          finish('completed');
+          return;
+        }
+
+        if (
+          loop.outcome === 'preference' &&
+          !longTerm.trim() &&
+          !input.memory.trim()
+        ) {
+          publish({
+            id: 'plan',
+            kind: 'plan',
+            title: '整理回答',
+            detail: '没有已确认的个人偏好，我会直接说明。',
+            status: 'done',
+          });
+          publish({
+            id: 'done',
+            kind: 'done',
+            title: '已完成',
+            status: 'done',
+          });
+          writeText(UNANSWERABLE);
+          finish('completed');
+          return;
+        }
+
+        const evidence = loop.items;
+        publish({
+          id: 'plan',
+          kind: 'plan',
+          title: '整理回答',
+          detail: planDetail(loop.outcome, evidence),
+          status: 'done',
+        });
+        const aborted = await generate(
+          ...promptOf(
+            loop.outcome,
+            input.searchQuestion,
+            evidence,
+            input.memory,
+            longTerm,
+          ),
+          {
+            intent: loop.outcome,
+            query: loop.query,
+            documentCount: evidence.length,
           },
-          (text) => ({ answer: text }),
         );
-        return aborted;
-      };
-
-      writer.write({ type: 'start' });
-      writer.write({ type: 'start-step' });
-      const short = clip(input.question, 24);
-      const rewritten = input.searchQuestion !== input.question;
-      publish({
-        id: 'organize',
-        kind: 'fold',
-        title: `整理「${short}」`,
-        detail: rewritten
-          ? `问题里的指代不清楚，已结合${input.contextLabel}改写为：${input.searchQuestion}`
-          : '我先确认要查的对象和范围。',
-        status: 'done',
-      });
-
-      let longTerm = '';
-      try {
-        const recalled = await input.recall(input.searchQuestion);
-        longTerm = recalled.text;
-      } catch {
-        longTerm = '';
-      }
-      if (input.abortSignal.aborted) {
-        answer = '回答已中断。';
-        finish('aborted');
-        return;
-      }
-
-      const loop = await runAgentLoop({
-        question: input.searchQuestion,
-        memory: input.memory,
-        longTerm,
-        limit: input.limit,
-        signal: input.abortSignal,
-        trace: input.trace,
-        retrieve: input.retrieve,
-        retrieveGraph: input.retrieveGraph,
-        retrieveWeb: input.retrieveWeb,
-        onStep: publish,
-      });
-      if (loop.outcome === 'aborted') {
-        answer = '回答已中断。';
-        finish('aborted');
-        return;
-      }
-      if (loop.outcome === 'unavailable') {
+        if (aborted) {
+          finish('aborted');
+          return;
+        }
         publish({
-          id: 'sources',
-          kind: 'sources',
-          title: '检索失败',
-          detail: '文档和图谱都暂时不可用。',
+          id: 'done',
+          kind: 'done',
+          title: failed ? '回答未完成' : '已完成',
           status: 'done',
-          sources: [],
         });
-        publish({ id: 'done', kind: 'done', title: '已完成', status: 'done' });
-        writeText('文档和图谱都暂时不可用，请稍后再试。');
+
+        if (loop.outcome === 'answer') {
+          items = citedItems(evidence, answer);
+          const sources = citedSources(evidence, answer);
+          publish({
+            id: 'sources',
+            kind: 'sources',
+            title:
+              sources.length === 0
+                ? '没有可引用的资料'
+                : `引用 ${sources.length} 条资料`,
+            detail: sources.length === 0 ? '回答没有标出资料编号。' : undefined,
+            status: 'done',
+            sources,
+          });
+        }
         finish('completed');
-        return;
-      }
-      if (loop.outcome === 'refuse' || (loop.outcome === 'answer' && loop.items.length === 0)) {
-        const refused = refuseCopy(loop.refuseReason);
-        publish({
-          id: 'plan',
-          kind: 'plan',
-          title: '整理回答',
-          detail: refused.detail,
-          status: 'done',
+      }),
+    onEnd: async ({ isAborted, isCancelled, outcome }) =>
+      runtime.run(async () => {
+        if (persisted) return;
+        persisted = true;
+        const content = answer.trim() || (isAborted ? '回答已中断。' : '');
+        const aborted = Boolean(
+          isAborted ||
+            isCancelled ||
+            runtime.signal.aborted ||
+            input.abortSignal.aborted,
+        );
+        await input.onEnd({
+          answer: content,
+          items,
+          steps: [...steps],
+          aborted,
+          status: aborted
+            ? 'aborted'
+            : failed || outcome.status === 'failed'
+              ? 'failed'
+              : 'completed',
         });
-        publish({
-          id: 'sources',
-          kind: 'sources',
-          title: '没有可引用的资料',
-          detail: '评估没有通过的资料不会展示。',
-          status: 'done',
-          sources: [],
-        });
-        publish({ id: 'done', kind: 'done', title: '已完成', status: 'done' });
-        writeText(refused.text);
-        finish('completed');
-        return;
-      }
-
-      if (loop.outcome === 'preference' && !longTerm.trim() && !input.memory.trim()) {
-        publish({
-          id: 'plan',
-          kind: 'plan',
-          title: '整理回答',
-          detail: '没有已确认的个人偏好，我会直接说明。',
-          status: 'done',
-        });
-        publish({ id: 'done', kind: 'done', title: '已完成', status: 'done' });
-        writeText(UNANSWERABLE);
-        finish('completed');
-        return;
-      }
-
-      const evidence = loop.items;
-      publish({
-        id: 'plan',
-        kind: 'plan',
-        title: '整理回答',
-        detail: planDetail(loop.outcome, evidence),
-        status: 'done',
-      });
-      publish({ id: 'done', kind: 'done', title: '已完成', status: 'done' });
-
-      const aborted = await generate(
-        ...promptOf(loop.outcome, input.searchQuestion, evidence, input.memory, longTerm),
-        {
-          intent: loop.outcome,
-          query: loop.query,
-          documentCount: evidence.length,
-        },
-      );
-      if (aborted) {
-        finish('aborted');
-        return;
-      }
-
-      if (loop.outcome === 'answer') {
-        items = citedItems(evidence, answer);
-        const sources = citedSources(evidence, answer);
-        publish({
-          id: 'sources',
-          kind: 'sources',
-          title: sources.length === 0 ? '没有可引用的资料' : `引用 ${sources.length} 条资料`,
-          detail: sources.length === 0 ? '回答没有标出资料编号。' : undefined,
-          status: 'done',
-          sources,
-        });
-      }
-      finish('completed');
-    },
-    onEnd: async ({ isAborted }) => {
-      if (persisted) return;
-      persisted = true;
-      const content = answer.trim() || (isAborted ? '回答已中断。' : '');
-      await input.onEnd({
-        answer: content,
-        items,
-        steps: [...steps],
-        aborted: isAborted || input.abortSignal.aborted,
-      });
-    },
+      }),
   });
 }
 
@@ -282,7 +381,7 @@ export function promptOf(
     const prompt = preferencePrompt(question, memory, longTerm);
     return [prompt.instructions, prompt.prompt];
   }
-  const prompt = answerPrompt(question, items, memory);
+  const prompt = answerPrompt(question, items, memory, longTerm);
   return [prompt.instructions, prompt.prompt];
 }
 
@@ -292,24 +391,43 @@ function planDetail(outcome: string, items: HybridHitView[]) {
   const web = items.filter((item) => item.channels.includes('web')).length;
   const graph = items.filter((item) => item.channels.includes('graph')).length;
   const docs = items.length - web - graph;
-  if (web && !graph && !docs) return `网页资料已评估为切题，我将根据这 ${web} 条网页回答，并标出 [n]。`;
-  if (graph && docs) return `文档和图谱都已评估为切题，我将根据这 ${items.length} 条资料回答，并标出 [n]。`;
-  if (graph) return `图谱关系已评估为切题，我将根据这 ${graph} 条关系回答，并标出 [n]。`;
+  if (web && !graph && !docs)
+    return `网页资料已评估为切题，我将根据这 ${web} 条网页回答，并标出 [n]。`;
+  if (graph && docs)
+    return `文档和图谱都已评估为切题，我将根据这 ${items.length} 条资料回答，并标出 [n]。`;
+  if (graph)
+    return `图谱关系已评估为切题，我将根据这 ${graph} 条关系回答，并标出 [n]。`;
   return `资料已评估为切题，我将根据 ${items.length} 条资料回答，并标出 [n]。`;
 }
 
 /** 知识库或联网不够时的固定句子。评测用同一句，才能判断拒答是否正确。 */
-export function refuseCopy(reason: 'knowledge' | 'web-insufficient' | 'web-unavailable' | 'web-off' | undefined) {
+export function refuseCopy(
+  reason:
+    | 'knowledge'
+    | 'web-insufficient'
+    | 'web-unavailable'
+    | 'web-off'
+    | undefined,
+) {
   if (reason === 'web-unavailable') {
-    return { detail: '联网检索暂时不可用，我会直接说明。', text: '联网检索暂时不可用，请稍后再试。' };
+    return {
+      detail: '联网检索暂时不可用，我会直接说明。',
+      text: '联网检索暂时不可用，请稍后再试。',
+    };
   }
   if (reason === 'web-off') {
     return { detail: '联网检索还不可用，我会直接说明。', text: UNANSWERABLE };
   }
   if (reason === 'web-insufficient') {
-    return { detail: '网页资料也不足以回答，我会直接说明。', text: UNANSWERABLE };
+    return {
+      detail: '网页资料也不足以回答，我会直接说明。',
+      text: UNANSWERABLE,
+    };
   }
-  return { detail: '知识库里没有能支撑回答的内容，我会直接说明。', text: UNANSWERABLE };
+  return {
+    detail: '知识库里没有能支撑回答的内容，我会直接说明。',
+    text: UNANSWERABLE,
+  };
 }
 
 function clip(text: string, max: number) {

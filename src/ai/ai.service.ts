@@ -4,10 +4,10 @@ import {
   ServiceUnavailableException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { ChatOpenAI } from '@langchain/openai';
 import { In, Repository } from 'typeorm';
 import {
   filterReadableChunks,
+  readableDocumentWhere,
   toDocumentAccess,
   type DocumentAccessTarget,
   type DocumentViewer,
@@ -16,8 +16,19 @@ import { decodeUploadedText } from '../document/decode-uploaded-text.js';
 import { Document } from '../document/entities/document.entity.js';
 import { AskDto } from './dto/ask.dto.js';
 import { retrieveChunks } from './hybrid-retriever.js';
-import { chatMessages, UNANSWERABLE } from './prompt.js';
-import { hitTrace, insideTrace, startChatTrace } from './langsmith.js';
+import { answerPrompt, UNANSWERABLE } from './prompt.js';
+import {
+  hitTrace,
+  insideTrace,
+  startChatTrace,
+  tracedGenerateText,
+} from './langsmith.js';
+import {
+  AgentRuntime,
+  currentRuntime,
+  throwIfRunStopped,
+} from './agent-runtime.js';
+import { createChatModel } from './chat-model.js';
 import type { ChatResultView, HybridResultView } from './ai.view.js';
 
 const DEFAULT_LIMIT = 5;
@@ -35,15 +46,31 @@ export class AiService {
   ) {}
 
   /** 关键词加向量融合。不调用对话模型。结果只保留当前用户能读的已发布文档。 */
-  async retrieve(viewer: DocumentViewer, dto: AskDto): Promise<HybridResultView> {
+  async retrieve(
+    viewer: DocumentViewer,
+    dto: AskDto,
+  ): Promise<HybridResultView> {
+    if (!currentRuntime())
+      return new AgentRuntime().run(() => this.retrieve(viewer, dto));
     const question = requiredQuestion(dto.question);
     if (insideTrace()) {
-      const items = await this.retrieveItems(viewer, question, dto.limit ?? DEFAULT_LIMIT);
+      const items = await this.retrieveItems(
+        viewer,
+        question,
+        dto.limit ?? DEFAULT_LIMIT,
+      );
       return { question, items };
     }
-    const trace = startChatTrace('文档检索', { question, limit: dto.limit ?? DEFAULT_LIMIT });
+    const trace = startChatTrace('文档检索', {
+      question,
+      limit: dto.limit ?? DEFAULT_LIMIT,
+    });
     try {
-      const items = await this.retrieveItems(viewer, question, dto.limit ?? DEFAULT_LIMIT);
+      const items = await this.retrieveItems(
+        viewer,
+        question,
+        dto.limit ?? DEFAULT_LIMIT,
+      );
       await trace.end(hitTrace(items));
       return { question, items };
     } catch (error) {
@@ -54,6 +81,8 @@ export class AiService {
 
   /** 先混合检索，再把命中的原文交给对话模型。没有资料时不调用模型。 */
   async chat(viewer: DocumentViewer, dto: AskDto): Promise<ChatResultView> {
+    if (!currentRuntime())
+      return new AgentRuntime().run(() => this.chat(viewer, dto));
     const question = requiredQuestion(dto.question);
     const limit = dto.limit ?? DEFAULT_LIMIT;
     const trace = startChatTrace('直接问答', { question, limit });
@@ -74,8 +103,15 @@ export class AiService {
         'llm',
         { question, count: items.length },
         async () => {
-          const response = await createChat().invoke(chatMessages(question, items));
-          return messageText(response.content).trim() || UNANSWERABLE;
+          const prompt = answerPrompt(question, items);
+          const { text } = await tracedGenerateText({
+            model: createChatModel(),
+            system: prompt.instructions,
+            prompt: prompt.prompt,
+            temperature: 0,
+            maxOutputTokens: 2_048,
+          });
+          return text.trim() || UNANSWERABLE;
         },
         (text) => ({ answer: text }),
       );
@@ -83,18 +119,34 @@ export class AiService {
       return { question, answer, items };
     } catch (error) {
       await trace.end({}, error);
-      if (error instanceof ServiceUnavailableException || error instanceof BadRequestException) {
+      if (
+        error instanceof ServiceUnavailableException ||
+        error instanceof BadRequestException
+      ) {
         throw error;
       }
       throw new ServiceUnavailableException('对话不可用');
     }
   }
 
-  private async retrieveItems(viewer: DocumentViewer, question: string, limit: number) {
+  private async retrieveItems(
+    viewer: DocumentViewer,
+    question: string,
+    limit: number,
+  ) {
     let items;
     try {
-      items = await retrieveChunks(question, ACCESS_WINDOW);
-    } catch {
+      const allowed = await this.documentRepository.find({
+        where: readableDocumentWhere(viewer),
+        select: { id: true, contentId: true },
+      });
+      items = await retrieveChunks(
+        question,
+        ACCESS_WINDOW,
+        allowed.map((row) => row.contentId),
+      );
+    } catch (error) {
+      throwIfRunStopped(error);
       throw new ServiceUnavailableException('混合检索不可用');
     }
     return this.readableItems(viewer, items, limit);
@@ -111,6 +163,9 @@ export class AiService {
   ) {
     const documents = await this.loadDocuments(items);
     return filterReadableChunks(items, viewer, documents)
+      .filter(
+        (item) => item.contentId === documents.get(item.documentId)?.contentId,
+      )
       .slice(0, limit)
       .map((item) => {
         const row = documents.get(item.documentId);
@@ -128,10 +183,15 @@ export class AiService {
   /** 按切片上的文档 id 取未删除文档。id 不是数字的切片没有对应行，后面会被权限过滤掉。 */
   private async loadDocuments(items: Array<{ documentId: string }>) {
     const ids = [
-      ...new Set(items.map((item) => item.documentId).filter((id) => /^\d+$/.test(id))),
+      ...new Set(
+        items.map((item) => item.documentId).filter((id) => /^\d+$/.test(id)),
+      ),
     ];
     if (ids.length === 0) {
-      return new Map<string, DocumentAccessTarget & { title: string; contentId: string }>();
+      return new Map<
+        string,
+        DocumentAccessTarget & { title: string; contentId: string }
+      >();
     }
     const rows = await this.documentRepository.find({
       where: { id: In(ids.map((id) => BigInt(id))), deleted: false },
@@ -139,7 +199,11 @@ export class AiService {
     return new Map(
       rows.map((row) => [
         row.id.toString(),
-        { ...toDocumentAccess(row), title: row.title, contentId: row.contentId },
+        {
+          ...toDocumentAccess(row),
+          title: row.title,
+          contentId: row.contentId,
+        },
       ]),
     );
   }
@@ -151,42 +215,4 @@ function requiredQuestion(question: string) {
     throw new BadRequestException('问题不能为空');
   }
   return trimmed;
-}
-
-function createChat() {
-  const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) {
-    throw new ServiceUnavailableException('对话模型未配置');
-  }
-  return new ChatOpenAI({
-    apiKey,
-    model: process.env.CHAT_MODEL ?? 'qwen-plus',
-    temperature: 0,
-    configuration: {
-      baseURL:
-        process.env.OPENAI_BASE_URL ??
-        process.env.EMBEDDING_BASE_URL ??
-        'https://dashscope.aliyuncs.com/compatible-mode/v1',
-    },
-  });
-}
-
-function messageText(content: unknown) {
-  if (typeof content === 'string') {
-    return content;
-  }
-  if (!Array.isArray(content)) {
-    return '';
-  }
-  return content
-    .map((part) => {
-      if (typeof part === 'string') {
-        return part;
-      }
-      if (part && typeof part === 'object' && 'text' in part) {
-        return String(part.text ?? '');
-      }
-      return '';
-    })
-    .join('');
 }

@@ -6,7 +6,7 @@ export type EmbeddedChunk = DocumentChunk & {
 };
 
 /** 按当前 .env 的 Embedding 配置初始化。调用时再读取，避免模块加载时环境变量还没注入。 */
-export function createEmbeddings() {
+export function createEmbeddings(signal?: AbortSignal) {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) {
     throw new Error('缺少 OPENAI_API_KEY');
@@ -17,7 +17,21 @@ export function createEmbeddings() {
     model: process.env.EMBEDDING_MODEL ?? 'text-embedding-v3',
     dimensions: embeddingDimensions(),
     batchSize: embeddingBatchSize(),
+    timeout: 20_000,
+    maxRetries: 1,
     configuration: {
+      ...(signal
+        ? {
+            fetch: (input: RequestInfo | URL, init?: RequestInit) =>
+              fetch(input, {
+                ...init,
+                signal: AbortSignal.any([
+                  signal,
+                  ...(init?.signal ? [init.signal] : []),
+                ]),
+              }),
+          }
+        : {}),
       baseURL:
         process.env.EMBEDDING_BASE_URL ??
         'https://dashscope.aliyuncs.com/compatible-mode/v1',

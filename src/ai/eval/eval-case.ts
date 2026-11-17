@@ -1,4 +1,5 @@
 import type { AgentIntent } from '../agent-route.js';
+import type { DocumentViewer } from '../../document/document-access.js';
 
 /**
  * 一道评测题长什么样。
@@ -22,6 +23,9 @@ export type EvalCase = {
   /** 标准答案要点。空数组表示不评完整性。 */
   keyPoints: string[];
   note: string;
+  memory?: string;
+  longTerm?: string;
+  viewer?: DocumentViewer;
 };
 
 /**
@@ -50,6 +54,11 @@ export type MetricScore = {
 };
 
 export type CaseReport = {
+  durationMs: number;
+  status: 'completed' | 'failed';
+  calls: { model: number; tool: number };
+  expectRefuse: boolean;
+  refused: boolean;
   id: string;
   question: string;
   note: string;
@@ -60,6 +69,7 @@ export type CaseReport = {
   /** 第一轮文档检索的四项。不评检索时是 null。 */
   retrieval: {
     recall: number;
+    allEvidenceHit: number;
     precision: number;
     mrr: number;
     hit: number;

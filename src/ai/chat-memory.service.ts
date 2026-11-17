@@ -18,6 +18,7 @@ import {
 } from './chat-memory.js';
 import { createChatModel } from './chat-model.js';
 import { ChatMessage } from './entities/chat-message.entity.js';
+import { runAgentOperation, throwIfRunStopped } from './agent-runtime.js';
 
 /**
  * 一次提问前准备好的记忆。
@@ -34,7 +35,7 @@ export type PreparedMemory = {
 /**
  * 短期记忆的读写。
  * 先读 Redis；过期或没有时，用 Postgres 最近 20 条消息回填，并重新计 24 小时。
- * 同一会话同时有两条提问时，后写完的记忆会盖住先写完的那次。
+ * 会话服务使用数据库锁，保证同一会话的提问和记忆更新串行执行。
  */
 @Injectable()
 export class ChatMemoryService {
@@ -50,7 +51,11 @@ export class ChatMemoryService {
    * 读出上文，并在问题含糊时改写成可以单独检索的问句。
    * longTermText 是 Mem0 里已经检索到的长期记忆。没有上文时，只靠它也能消解指代。
    */
-  async prepare(sessionId: bigint, question: string, longTermText = ''): Promise<PreparedMemory> {
+  async prepare(
+    sessionId: bigint,
+    question: string,
+    longTermText = '',
+  ): Promise<PreparedMemory> {
     const snapshot = await this.load(sessionId);
     const memoryText = formatMemory(snapshot);
     const rewritten = await this.rewrite(question, memoryText, longTermText);
@@ -61,14 +66,22 @@ export class ChatMemoryService {
    * 回答结束后把这一轮写入 Redis。
    * fallback 是提问前的记忆。Redis 在回答期间被清掉时，用它接着写，避免只剩最新一句。
    */
-  async remember(sessionId: bigint, fallback: ChatMemory, question: string, answer: string) {
+  async remember(
+    sessionId: bigint,
+    fallback: ChatMemory,
+    question: string,
+    answer: string,
+  ) {
     try {
       const current = (await this.read(sessionId)) ?? fallback;
       const next = appendTurn(current, question, answer);
       const compact = await this.compress(next);
       await this.write(sessionId, compact);
     } catch (error) {
-      this.logger.error('写入短期记忆失败', error instanceof Error ? error.stack : String(error));
+      this.logger.error(
+        '写入短期记忆失败',
+        error instanceof Error ? error.stack : String(error),
+      );
     }
   }
 
@@ -77,7 +90,10 @@ export class ChatMemoryService {
     try {
       await this.redis.del(memoryKey(sessionId.toString()));
     } catch (error) {
-      this.logger.error('删除短期记忆失败', error instanceof Error ? error.stack : String(error));
+      this.logger.error(
+        '删除短期记忆失败',
+        error instanceof Error ? error.stack : String(error),
+      );
     }
   }
 
@@ -99,16 +115,37 @@ export class ChatMemoryService {
 
   private async read(sessionId: bigint): Promise<ChatMemory | null> {
     try {
-      const raw = await this.redis.get<string | ChatMemory>(memoryKey(sessionId.toString()));
+      const raw = await runAgentOperation(
+        () =>
+          this.redis.get<string | ChatMemory>(memoryKey(sessionId.toString())),
+        3_000,
+      );
       return parseMemory(raw);
     } catch (error) {
-      this.logger.error('读取短期记忆失败', error instanceof Error ? error.stack : String(error));
+      this.logger.error(
+        '读取短期记忆失败',
+        error instanceof Error ? error.stack : String(error),
+      );
       return null;
     }
   }
 
   private async write(sessionId: bigint, memory: ChatMemory) {
-    await this.redis.set(memoryKey(sessionId.toString()), JSON.stringify(memory), MEMORY_TTL_MS);
+    try {
+      await runAgentOperation(
+        () =>
+          this.redis.set(
+            memoryKey(sessionId.toString()),
+            JSON.stringify(memory),
+            MEMORY_TTL_MS,
+          ),
+        3_000,
+      );
+    } catch (error) {
+      this.logger.warn(
+        `Memory cache write skipped: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
   }
 
   /** 最近 20 条消息，按时间从旧到新。只取角色和正文。 */
@@ -122,6 +159,13 @@ export class ChatMemoryService {
       if (row.role !== 'user' && row.role !== 'assistant') {
         return [];
       }
+      if (
+        row.payload &&
+        !Array.isArray(row.payload) &&
+        'status' in row.payload &&
+        row.payload.status !== 'completed'
+      )
+        return [];
       const content = row.content.trim();
       if (!content) {
         return [];
@@ -135,7 +179,11 @@ export class ChatMemoryService {
    * 问题里有指代或追问，并且短期记忆或长期记忆至少有一边有内容时，改写成独立问题。
    * 改写失败或结果是空的，就继续用用户原话检索。
    */
-  private async rewrite(question: string, memoryText: string, longTermText: string) {
+  private async rewrite(
+    question: string,
+    memoryText: string,
+    longTermText: string,
+  ) {
     const blocks = [
       memoryText.trim() ? `对话记忆：\n${memoryText.trim()}` : '',
       longTermText.trim() ? `长期记忆：\n${longTermText.trim()}` : '',
@@ -157,7 +205,11 @@ export class ChatMemoryService {
       });
       return cleanRewrite(text) || question;
     } catch (error) {
-      this.logger.error('改写问题失败', error instanceof Error ? error.stack : String(error));
+      throwIfRunStopped(error);
+      this.logger.error(
+        '改写问题失败',
+        error instanceof Error ? error.stack : String(error),
+      );
       return question;
     }
   }
@@ -178,7 +230,10 @@ export class ChatMemoryService {
       }
       return { summary, turns: split.recent };
     } catch (error) {
-      this.logger.error('压缩对话记忆失败', error instanceof Error ? error.stack : String(error));
+      this.logger.error(
+        '压缩对话记忆失败',
+        error instanceof Error ? error.stack : String(error),
+      );
       return memory;
     }
   }
@@ -186,7 +241,9 @@ export class ChatMemoryService {
   /** 把已有摘要和更早的原文合成一段新摘要。 */
   private async summarize(summary: string, turns: MemoryTurn[]) {
     const history = turns
-      .map((turn) => `${turn.role === 'user' ? '用户' : '助手'}：${turn.content}`)
+      .map(
+        (turn) => `${turn.role === 'user' ? '用户' : '助手'}：${turn.content}`,
+      )
       .join('\n');
     const { text } = await tracedGenerateText({
       model: createChatModel(),
@@ -205,13 +262,21 @@ export class ChatMemoryService {
 }
 
 /** Redis 里可能是 JSON 字符串，也可能已经被缓存层解析成对象。对不上结构就当成没有记忆。 */
-function parseMemory(raw: string | ChatMemory | null | undefined): ChatMemory | null {
+function parseMemory(
+  raw: string | ChatMemory | null | undefined,
+): ChatMemory | null {
   const value = typeof raw === 'string' ? parseJson(raw) : raw;
   if (!value || typeof value !== 'object') {
     return null;
   }
-  const summary = 'summary' in value && typeof value.summary === 'string' ? value.summary : '';
-  const turns = 'turns' in value && Array.isArray(value.turns) ? value.turns.flatMap(parseTurn) : [];
+  const summary =
+    'summary' in value && typeof value.summary === 'string'
+      ? value.summary
+      : '';
+  const turns =
+    'turns' in value && Array.isArray(value.turns)
+      ? value.turns.flatMap(parseTurn)
+      : [];
   // 空对象不能当成命中，否则 Redis 里的空壳会挡住 Postgres 回填。
   if (!summary && turns.length === 0) {
     return null;
@@ -225,7 +290,10 @@ function parseTurn(value: unknown): MemoryTurn[] {
   }
   const role = 'role' in value ? value.role : undefined;
   const content = 'content' in value ? value.content : undefined;
-  if ((role !== 'user' && role !== 'assistant') || typeof content !== 'string') {
+  if (
+    (role !== 'user' && role !== 'assistant') ||
+    typeof content !== 'string'
+  ) {
     return [];
   }
   const text = content.trim();

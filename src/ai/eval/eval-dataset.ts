@@ -10,8 +10,8 @@ import type { EvalCase } from './eval-case.js';
  * 文档被删掉、或正文里不再有这个词，这题的检索分数会空着，并在结果里标成「标注没对上」。
  *
  * 下面这些题还没有覆盖，需要以后自己加：
- * - 带上文的指代，例如先问报销再问「那补贴呢」。评测每题都是单独一句，不读 Redis。
- * - 已经记住的个人偏好。评测不写 Mem0，偏好题只检查「没有记忆时会不会拒答」。
+ * - Redis 中真实多轮指代的读写。当前上下文题使用注入的固定记忆。
+ * - Mem0 的真实跨会话记忆。偏好题使用固定记忆或空记忆，不写 Mem0。
  * - 普通用户看不到未公开文档。评测用管理员阅读已发布文档，权限过滤不在分数里。
  * - 图谱单独的命中。图里的四项只比文档切片。
  * - 天气题只要求提到地点和天气，不要求某一个温度，因为预报每天都在变。
@@ -31,12 +31,37 @@ const ONBOARD = '373727058972381184';
 
 export const EVAL_DATASET: EvalCase[] = [
   {
+    id: 'remembered-preference',
+    question: '我平时喜欢吃什么？',
+    intent: 'preference',
+    expectRefuse: false,
+    memory: '',
+    longTerm: '长期信息：用户偏好清淡饮食，喜欢面条。',
+    gold: [],
+    keyPoints: ['喜欢面条', '偏好清淡饮食'],
+    note: '有长期记忆时必须能回答，不能沿用空记忆拒答。',
+  },
+  {
+    id: 'followup-context',
+    question: '那报销超过 5000 元呢，谁加签？',
+    intent: 'knowledge',
+    expectRefuse: false,
+    memory: '最近对话：用户正在咨询出差报销审批流程。',
+    gold: [{ chunkId: APPROVAL, documentId: EXPENSE, mustContain: '5000' }],
+    keyPoints: ['部门总监加签'],
+    note: '显式提供上文，检验带上下文的路由和生成。',
+  },
+  {
     id: 'expense-approver',
     question: '报销需要谁审批？',
     intent: 'knowledge',
     expectRefuse: false,
     gold: [{ chunkId: APPROVAL, documentId: EXPENSE, mustContain: '5000' }],
-    keyPoints: ['直属 Leader 审批出差申请', '超过 5000 元需要部门总监加签', '财务审核员负责发票和金额复核'],
+    keyPoints: [
+      '直属 Leader 审批出差申请',
+      '超过 5000 元需要部门总监加签',
+      '财务审核员负责发票和金额复核',
+    ],
     note: '审批链在差旅办法的出差审批流程里。',
   },
   {
@@ -108,7 +133,11 @@ export const EVAL_DATASET: EvalCase[] = [
     intent: 'knowledge',
     expectRefuse: false,
     gold: [{ chunkId: SUBMIT, documentId: EXPENSE, mustContain: '8801' }],
-    keyPoints: ['出差餐饮按 100 元/天包干，不需要发票', '当日返回不计补贴', '客户招待不能和差旅补贴一起领'],
+    keyPoints: [
+      '出差餐饮按 100 元/天包干，不需要发票',
+      '当日返回不计补贴',
+      '客户招待不能和差旅补贴一起领',
+    ],
     note: '补贴规则和报销提交流程在同一段切片。',
   },
   {
@@ -173,7 +202,9 @@ export const EVAL_DATASET: EvalCase[] = [
     question: '入职当天要办哪些手续？',
     intent: 'knowledge',
     expectRefuse: false,
-    gold: [{ chunkId: ONBOARD, documentId: ONBOARD_DOC, mustContain: 'GitLab' }],
+    gold: [
+      { chunkId: ONBOARD, documentId: ONBOARD_DOC, mustContain: 'GitLab' },
+    ],
     keyPoints: ['领取工牌', '开通 GitLab', '开通企业邮箱'],
     note: '入职指南目前只有这一段正文。',
   },
@@ -182,7 +213,9 @@ export const EVAL_DATASET: EvalCase[] = [
     question: '知识库由哪个部门负责？',
     intent: 'knowledge',
     expectRefuse: false,
-    gold: [{ chunkId: ONBOARD, documentId: ONBOARD_DOC, mustContain: 'GitLab' }],
+    gold: [
+      { chunkId: ONBOARD, documentId: ONBOARD_DOC, mustContain: 'GitLab' },
+    ],
     keyPoints: ['研发中心负责知识库'],
     note: '不要答成发布流程里的平台工程部。那是另一篇文档。',
   },
@@ -209,7 +242,9 @@ export const EVAL_DATASET: EvalCase[] = [
     question: '线上故障的紧急发布要谁审批？',
     intent: 'knowledge',
     expectRefuse: false,
-    gold: [{ chunkId: SOP_RELEASE, documentId: SOP, mustContain: '2026-01-20' }],
+    gold: [
+      { chunkId: SOP_RELEASE, documentId: SOP, mustContain: '2026-01-20' },
+    ],
     keyPoints: ['紧急窗口需要总监审批'],
     note: '封网期也只允许紧急变更。',
   },
@@ -218,7 +253,9 @@ export const EVAL_DATASET: EvalCase[] = [
     question: '2026 年一季度封网从哪天到哪天？',
     intent: 'knowledge',
     expectRefuse: false,
-    gold: [{ chunkId: SOP_RELEASE, documentId: SOP, mustContain: '2026-01-20' }],
+    gold: [
+      { chunkId: SOP_RELEASE, documentId: SOP, mustContain: '2026-01-20' },
+    ],
     keyPoints: ['2026-01-20 至 2026-01-27'],
     note: '封网期内常规发布窗口关闭。',
   },
@@ -227,7 +264,9 @@ export const EVAL_DATASET: EvalCase[] = [
     question: '灰度发布默认放多少流量，观察多久？',
     intent: 'knowledge',
     expectRefuse: false,
-    gold: [{ chunkId: SOP_RELEASE, documentId: SOP, mustContain: '2026-01-20' }],
+    gold: [
+      { chunkId: SOP_RELEASE, documentId: SOP, mustContain: '2026-01-20' },
+    ],
     keyPoints: ['默认灰度 10% 的 Pod', '观察 15 分钟无异常后全量'],
     note: '知识库和订单中心使用 Kubernetes 滚动发布。',
   },
@@ -236,8 +275,13 @@ export const EVAL_DATASET: EvalCase[] = [
     question: '什么情况下要立刻回滚？',
     intent: 'knowledge',
     expectRefuse: false,
-    gold: [{ chunkId: SOP_RELEASE, documentId: SOP, mustContain: '2026-01-20' }],
-    keyPoints: ['5 分钟内错误率上升超过 2% 要立刻回滚', '使用 Helm 回退上一版本'],
+    gold: [
+      { chunkId: SOP_RELEASE, documentId: SOP, mustContain: '2026-01-20' },
+    ],
+    keyPoints: [
+      '5 分钟内错误率上升超过 2% 要立刻回滚',
+      '使用 Helm 回退上一版本',
+    ],
     note: '回滚后还要通知产品经理是否对外公告。',
   },
   {

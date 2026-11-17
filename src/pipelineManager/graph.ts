@@ -1,5 +1,5 @@
 import { Logger } from '@nestjs/common';
-import neo4j, { type Driver } from 'neo4j-driver';
+import neo4j, { type Driver, type ManagedTransaction } from 'neo4j-driver';
 import { splitToChunks } from './chunk.js';
 import {
   extractChunkGraph,
@@ -68,13 +68,29 @@ export async function createDocumentGraph(input: {
   publishedAt: string;
   content: string;
 }): Promise<GraphWriteResult | null> {
+  const write = await prepareDocumentGraph(input);
+  return write ? write() : null;
+}
+
+/** Extract first; the caller can validate the version again before committing. */
+export async function prepareDocumentGraph(input: {
+  documentId: string;
+  contentId: string;
+  title: string;
+  publishedAt: string;
+  content: string;
+}): Promise<(() => Promise<GraphWriteResult>) | null> {
   const config = getNeo4jConfig();
   if (!config.enabled) {
     logger.warn('Neo4j 未启用，跳过创建图谱');
     return null;
   }
 
-  const chunks = await splitToChunks(input.title, input.content);
+  const chunks = await splitToChunks(
+    input.title,
+    input.content,
+    `${input.documentId}:${input.contentId}`,
+  );
   if (chunks.length === 0) {
     throw new Error('文档切分结果为空');
   }
@@ -103,22 +119,22 @@ export async function createDocumentGraph(input: {
     }
   }
 
-  await deleteDocumentGraph(input.documentId);
-
-  const session = getDriver(config).session({ database: config.database });
-  try {
-    await session.run(
-      'CREATE CONSTRAINT document_document_id IF NOT EXISTS FOR (d:Document) REQUIRE d.documentId IS UNIQUE',
-    );
-    await session.run(
-      'CREATE CONSTRAINT chunk_chunk_id IF NOT EXISTS FOR (c:Chunk) REQUIRE c.chunkId IS UNIQUE',
-    );
-    await session.run(
-      'CREATE CONSTRAINT entity_type_name IF NOT EXISTS FOR (e:Entity) REQUIRE (e.type, e.name) IS UNIQUE',
-    );
-    await session.executeWrite(async (tx) => {
-      await tx.run(
-        `
+  return async () => {
+    const session = getDriver(config).session({ database: config.database });
+    try {
+      await session.run(
+        'CREATE CONSTRAINT document_document_id IF NOT EXISTS FOR (d:Document) REQUIRE d.documentId IS UNIQUE',
+      );
+      await session.run(
+        'CREATE CONSTRAINT chunk_chunk_id IF NOT EXISTS FOR (c:Chunk) REQUIRE c.chunkId IS UNIQUE',
+      );
+      await session.run(
+        'CREATE CONSTRAINT entity_type_name IF NOT EXISTS FOR (e:Entity) REQUIRE (e.type, e.name) IS UNIQUE',
+      );
+      await session.executeWrite(async (tx) => {
+        await clearGraph(tx, input.documentId);
+        await tx.run(
+          `
         MERGE (d:Document {documentId: $documentId})
         SET d.contentId = $contentId,
             d.title = $title,
@@ -128,64 +144,66 @@ export async function createDocumentGraph(input: {
         MERGE (c:Chunk {chunkId: chunk.id})
         SET c.documentId = $documentId,
             c.title = chunk.title,
+            c.contentId = $contentId,
             c.content = chunk.content,
             c.index = toInteger(chunk.index)
         MERGE (d)-[h:HAS_CHUNK]->(c)
         SET h.index = toInteger(chunk.index)
         `,
-        {
-          documentId: input.documentId,
-          contentId: input.contentId,
-          title: input.title,
-          publishedAt: input.publishedAt,
-          chunks: chunks.map((chunk, index) => ({
-            id: chunk.id,
-            title: chunk.title,
-            content: chunk.content,
-            index,
-          })),
-        },
-      );
-      if (mentions.length > 0) {
-        await tx.run(
-          `
+          {
+            documentId: input.documentId,
+            contentId: input.contentId,
+            title: input.title,
+            publishedAt: input.publishedAt,
+            chunks: chunks.map((chunk, index) => ({
+              id: chunk.id,
+              title: chunk.title,
+              content: chunk.content,
+              index,
+            })),
+          },
+        );
+        if (mentions.length > 0) {
+          await tx.run(
+            `
           UNWIND $mentions AS mention
           MATCH (c:Chunk {chunkId: mention.chunkId})
           MERGE (e:Entity {type: mention.type, name: mention.name})
           MERGE (c)-[m:MENTIONS]->(e)
           SET m.documentId = $documentId
           `,
-          { documentId: input.documentId, mentions },
-        );
-      }
-      if (relations.length > 0) {
-        await tx.run(
-          `
+            { documentId: input.documentId, mentions },
+          );
+        }
+        if (relations.length > 0) {
+          await tx.run(
+            `
           UNWIND $relations AS rel
           MERGE (s:Entity {type: rel.sourceType, name: rel.source})
           MERGE (t:Entity {type: rel.targetType, name: rel.target})
           MERGE (s)-[r:RELATED {documentId: $documentId, chunkId: rel.chunkId, type: rel.type}]->(t)
           `,
-          { documentId: input.documentId, relations },
-        );
-      }
-    });
-  } finally {
-    await session.close();
-  }
+            { documentId: input.documentId, relations },
+          );
+        }
+      });
+    } finally {
+      await session.close();
+    }
 
-  const entityKeys = new Set<string>();
-  for (const mention of mentions) {
-    entityKeys.add(`${mention.type}\0${mention.name}`);
-  }
-  for (const relation of relations) {
-    entityKeys.add(`${relation.sourceType}\0${relation.source}`);
-    entityKeys.add(`${relation.targetType}\0${relation.target}`);
-  }
-  return {
-    chunks: chunks.length,
-    entities: entityKeys.size,
-    relations: relations.length,
+    const entityKeys = new Set<string>();
+    for (const mention of mentions) {
+      entityKeys.add(`${mention.type}\0${mention.name}`);
+    }
+    for (const relation of relations) {
+      entityKeys.add(`${relation.sourceType}\0${relation.source}`);
+      entityKeys.add(`${relation.targetType}\0${relation.target}`);
+    }
+    return {
+      chunks: chunks.length,
+      entities: entityKeys.size,
+      relations: relations.length,
+    };
   };
 }
 
@@ -203,42 +221,44 @@ export async function deleteDocumentGraph(documentId: string) {
 
   const session = getDriver(config).session({ database: config.database });
   try {
-    await session.executeWrite(async (tx) => {
-      await tx.run(
-        `
+    await session.executeWrite((tx) => clearGraph(tx, documentId));
+  } finally {
+    await session.close();
+  }
+}
+
+async function clearGraph(tx: ManagedTransaction, documentId: string) {
+  await tx.run(
+    `
         MATCH ()-[r:RELATED {documentId: $documentId}]-()
         DELETE r
         `,
-        { documentId },
-      );
-      await tx.run(
-        `
+    { documentId },
+  );
+  await tx.run(
+    `
         MATCH (d:Document {documentId: $documentId})
         OPTIONAL MATCH (d)-[:HAS_CHUNK]->(c:Chunk)
         WITH d, collect(DISTINCT c) AS chunks
         FOREACH (c IN chunks | DETACH DELETE c)
         DETACH DELETE d
         `,
-        { documentId },
-      );
-      await tx.run(
-        `
+    { documentId },
+  );
+  await tx.run(
+    `
         MATCH (c:Chunk {documentId: $documentId})
         DETACH DELETE c
         `,
-        { documentId },
-      );
-      await tx.run(
-        `
+    { documentId },
+  );
+  await tx.run(
+    `
         MATCH (e:Entity)
         WHERE NOT (e)<-[:MENTIONS]-()
           AND NOT (e)-[:RELATED]-()
           AND NOT ()-[:RELATED]->(e)
         DETACH DELETE e
         `,
-      );
-    });
-  } finally {
-    await session.close();
-  }
+  );
 }

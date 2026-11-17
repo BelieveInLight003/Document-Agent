@@ -4,6 +4,7 @@ import { generateText, streamText, wrapLanguageModel } from 'ai';
 import { RunTree } from 'langsmith/run_trees';
 import { getCurrentRunTree, withRunTree } from 'langsmith/traceable';
 import { wrapAISDK } from 'langsmith/experimental/vercel';
+import { modelRequestSettings } from './agent-runtime.js';
 import type { HybridHitView } from './ai.view.js';
 import {
   enableLangfuse,
@@ -31,9 +32,22 @@ const traced = wrapAISDK(
 );
 
 /** 改写、摘要、记忆分类走这里，才能挂到当前问题的 trace 上。 */
-export const tracedGenerateText = traced.generateText;
+export const tracedGenerateText: typeof generateText = ((
+  options: Parameters<typeof generateText>[0],
+) =>
+  traced.generateText({
+    ...options,
+    maxOutputTokens: options.maxOutputTokens ?? 1_024,
+    ...modelRequestSettings(options.abortSignal),
+  })) as typeof generateText;
 /** 流式回答走这里。消费 textStream 时，这次调用仍挂在「生成回答」下面。 */
-export const tracedStreamText = traced.streamText;
+export const tracedStreamText: typeof streamText = ((
+  options: Parameters<typeof streamText>[0],
+) =>
+  traced.streamText({
+    ...options,
+    ...modelRequestSettings(options.abortSignal),
+  })) as typeof streamText;
 
 export type TraceRunType = 'chain' | 'retriever' | 'llm';
 
@@ -74,43 +88,63 @@ export function startChatTrace(
 ): ChatTrace {
   const fuse = openLangfuseTrace(name, inputs, metadata);
   if (!tracing) return fuse ? langfuseTrace(fuse) : emptyTrace();
-  const root = new RunTree({
-    name,
-    run_type: 'chain',
-    inputs,
-    metadata,
-    project_name: process.env.LANGSMITH_PROJECT,
-    tracingEnabled: true,
-  });
-  const opened = root.postRun().catch(report);
+  let root: RunTree;
+  try {
+    root = new RunTree({
+      name,
+      run_type: 'chain',
+      inputs,
+      metadata,
+      project_name: process.env.LANGSMITH_PROJECT,
+      tracingEnabled: true,
+    });
+  } catch (error) {
+    report(error);
+    return fuse ? langfuseTrace(fuse) : emptyTrace();
+  }
+  const opened = Promise.resolve()
+    .then(() => root.postRun())
+    .catch(report);
   let ended = false;
   return {
     async span(step, runType, stepInputs, fn, outputs) {
-      const exec = () => (fuse ? runLangfuseSpan(fuse.ctx, step, runType, stepInputs, fn, outputs) : fn());
+      const exec = () =>
+        fuse
+          ? runLangfuseSpan(fuse.ctx, step, runType, stepInputs, fn, outputs)
+          : fn();
       let child: RunTree;
+      let childOpened: Promise<unknown>;
       try {
-        await opened;
         child = root.createChild({
           name: step,
           run_type: runType,
           inputs: stepInputs,
           tracingEnabled: true,
         });
-        await child.postRun();
+        childOpened = opened.then(() => child.postRun()).catch(report);
       } catch (error) {
         report(error);
         return exec();
       }
       try {
         const value = await withRunTree(child, exec);
-        await child.end(outputs(value));
-        await child.patchRun();
+        try {
+          await child.end(outputs(value));
+          void childOpened.then(() => child.patchRun()).catch(report);
+        } catch (error) {
+          report(error);
+        }
         return value;
       } catch (error) {
-        await child
-          .end(undefined, error instanceof Error ? error.message : String(error))
-          .catch(report);
-        await child.patchRun().catch(report);
+        try {
+          await child.end(
+            undefined,
+            error instanceof Error ? error.message : String(error),
+          );
+        } catch (traceError) {
+          report(traceError);
+        }
+        void childOpened.then(() => child.patchRun()).catch(report);
         throw error;
       }
     },
@@ -118,12 +152,15 @@ export function startChatTrace(
       if (ended) return;
       ended = true;
       try {
-        await opened;
         await root.end(
           outputs,
-          error === undefined ? undefined : error instanceof Error ? error.message : String(error),
+          error === undefined
+            ? undefined
+            : error instanceof Error
+              ? error.message
+              : String(error),
         );
-        await root.patchRun();
+        void opened.then(() => root.patchRun()).catch(report);
       } catch (reportError) {
         report(reportError);
       }
@@ -162,7 +199,10 @@ export function insideTrace() {
  */
 function enableLangSmith() {
   const apiKey = envValue('LANGSMITH_API_KEY') || envValue('LANGCHAIN_API_KEY');
-  const project = envValue('LANGSMITH_PROJECT') || envValue('LANGCHAIN_PROJECT') || 'knowledge-hub';
+  const project =
+    envValue('LANGSMITH_PROJECT') ||
+    envValue('LANGCHAIN_PROJECT') ||
+    'knowledge-hub';
   const endpoint =
     envValue('LANGSMITH_ENDPOINT') ||
     envValue('LANGCHAIN_ENDPOINT') ||

@@ -62,6 +62,7 @@ import { RolesGuard } from './roles.guard.js';
     }),
   ],
   controllers: [AuthController],
+  // 内部注入
   providers: [
     AuthService,
     EmailVerificationService,

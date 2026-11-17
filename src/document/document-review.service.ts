@@ -1,10 +1,18 @@
 import {
   BadRequestException,
+  ForbiddenException,
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { DataSource, In, Repository } from 'typeorm';
+import { DataSource, In, Repository, type EntityManager } from 'typeorm';
+import {
+  canEditDocument,
+  canViewDocument,
+  toDocumentAccess,
+  type DocumentViewer,
+} from './document-access.js';
+import { lockDocument } from './document-lock.js';
 import { PipelineManagerService } from '../pipelineManager/pipeline-manager.service.js';
 import { DocumentStatus } from './document-status.js';
 import { ReviewStatus } from './document-review-status.js';
@@ -39,29 +47,40 @@ export class DocumentReviewService {
 
   /**
    * 草稿或已发布可以提交。已有待审核记录时不能再提交。
-   * 再次提交时如果当前是已发布，先删掉向量索引、全文索引和图谱。
+   * 已发布文档提交后立即退出可检索范围，并在同一事务中登记索引清理任务。
    */
-  async submit(documentId: string, dto: SubmitReviewDto) {
-    const document = await this.findDocument(documentId);
-    if (!submitableStatuses.includes(document.status)) {
-      throw new BadRequestException('只有草稿或已发布的文档可以提交审核');
-    }
+  async submit(
+    documentId: string,
+    _dto: SubmitReviewDto,
+    viewer: DocumentViewer,
+  ) {
+    return this.dataSource.transaction(async (manager) => {
+      await lockDocument(manager, documentId);
+      const document = await this.findDocument(documentId, manager);
+      this.requireEdit(viewer, document);
+      if (!submitableStatuses.includes(document.status)) {
+        throw new BadRequestException('只有草稿或已发布的文档可以提交审核');
+      }
 
-    const pending = await this.findPending(document.id);
-    if (pending) {
-      throw new BadRequestException('该文档已有待审核记录');
-    }
+      const pending = await manager.findOne(DocumentReview, {
+        where: { documentId: document.id, reviewStatus: ReviewStatus.PENDING },
+      });
+      if (pending) {
+        throw new BadRequestException('该文档已有待审核记录');
+      }
 
-    const wasPublished = document.status === DocumentStatus.PUBLISHED;
-    if (wasPublished) {
-      await this.pipelineManagerService.removeDocument(document.id.toString());
-    }
+      const wasPublished = document.status === DocumentStatus.PUBLISHED;
+      if (wasPublished) {
+        await this.pipelineManagerService.removeDocument(
+          document.id.toString(),
+          manager,
+        );
+      }
 
-    const review = await this.dataSource.transaction(async (manager) => {
-      const saved = await manager.save(
+      const review = await manager.save(
         manager.create(DocumentReview, {
           documentId: document.id,
-          submitterId: this.toBigint(dto.submitterId),
+          submitterId: BigInt(viewer.userId),
           reviewerId: null,
           statusBefore: document.status,
           statusAfter: null,
@@ -72,95 +91,113 @@ export class DocumentReviewService {
       );
       document.status = DocumentStatus.PENDING_REVIEW;
       await manager.save(document);
-      return saved;
-    });
 
-    return { review: this.serialize(review), cleared: wasPublished };
+      return { review: this.serialize(review), cleared: wasPublished };
+    });
   }
 
   /** 按审核单 taskId 找到文档，驳回后文档回到草稿。 */
-  async reject(taskId: string, dto: RejectReviewDto) {
-    const review = await this.findPendingReview(taskId);
-    const document = await this.findDocument(review.documentId.toString());
-    const opinion = dto.opinion.trim();
-    if (!opinion) {
-      throw new BadRequestException('审核意见不能为空');
-    }
-    const now = new Date();
+  async reject(taskId: string, dto: RejectReviewDto, viewer: DocumentViewer) {
+    const existing = await this.findReview(taskId);
+    return this.dataSource.transaction(async (manager) => {
+      await lockDocument(manager, existing.documentId.toString());
+      const review = await this.findPendingReview(taskId, manager);
+      const document = await this.findDocument(
+        review.documentId.toString(),
+        manager,
+      );
+      if (document.status !== DocumentStatus.PENDING_REVIEW) {
+        throw new BadRequestException('文档已退出审核状态');
+      }
+      const opinion = dto.opinion.trim();
+      if (!opinion) {
+        throw new BadRequestException('审核意见不能为空');
+      }
+      const now = new Date();
 
-    // dataSource 是当前 Postgres 连接。transaction 打开一个事务，
-    // manager 只在这个事务里保存，文档改回草稿和审核单驳回要么一起成功，要么一起回滚。
-    const saved = await this.dataSource.transaction(async (manager) => {
-      review.reviewerId = this.toBigint(dto.reviewerId);
+      review.reviewerId = BigInt(viewer.userId);
       review.opinion = opinion;
       review.reviewStatus = ReviewStatus.REJECTED;
       review.statusAfter = DocumentStatus.DRAFT;
       review.updatedAt = now;
       document.status = DocumentStatus.DRAFT;
-      if (dto.reviewerId) {
-        document.updateBy = this.toBigint(dto.reviewerId);
-      }
+      document.updateBy = BigInt(viewer.userId);
       await manager.save(document);
-      return manager.save(review);
+      const saved = await manager.save(review);
+      return { review: this.serialize(saved) };
     });
-    return { review: this.serialize(saved) };
   }
 
   /** 按审核单 taskId 找到文档，通过后变为已发布，并按当前正文重建三个索引。 */
-  async approve(taskId: string, dto: ApproveReviewDto) {
-    const review = await this.findPendingReview(taskId);
-    const document = await this.findDocument(review.documentId.toString());
-    const documentIdText = document.id.toString();
-    const wasPublished = review.statusBefore === DocumentStatus.PUBLISHED;
+  async approve(taskId: string, dto: ApproveReviewDto, viewer: DocumentViewer) {
+    const existing = await this.findReview(taskId);
+    return this.dataSource.transaction(async (manager) => {
+      await lockDocument(manager, existing.documentId.toString());
+      const review = await this.findPendingReview(taskId, manager);
+      const document = await this.findDocument(
+        review.documentId.toString(),
+        manager,
+      );
+      if (document.status !== DocumentStatus.PENDING_REVIEW) {
+        throw new BadRequestException('文档已退出审核状态');
+      }
+      const documentIdText = document.id.toString();
+      const wasPublished = review.statusBefore === DocumentStatus.PUBLISHED;
 
-    const publishedAt = new Date();
-    document.title = decodeUploadedText(document.title);
-    await this.pipelineManagerService.publishDocument({
-      documentId: documentIdText,
-      contentId: document.contentId,
-      title: document.title,
-      publishedAt: publishedAt.toISOString(),
-    });
+      const publishedAt = new Date();
+      document.title = decodeUploadedText(document.title);
+      review.reviewerId = BigInt(viewer.userId);
+      review.opinion = dto.opinion?.trim() || review.opinion;
+      review.reviewStatus = ReviewStatus.APPROVED;
+      review.statusAfter = DocumentStatus.PUBLISHED;
+      review.approvedAt = publishedAt;
+      review.updatedAt = publishedAt;
+      document.status = DocumentStatus.PUBLISHED;
+      document.publishTime = publishedAt;
+      document.updateBy = BigInt(viewer.userId);
 
-    review.reviewerId = this.toBigint(dto.reviewerId);
-    review.opinion = dto.opinion?.trim() || review.opinion;
-    review.reviewStatus = ReviewStatus.APPROVED;
-    review.statusAfter = DocumentStatus.PUBLISHED;
-    review.approvedAt = publishedAt;
-    review.updatedAt = publishedAt;
-    document.status = DocumentStatus.PUBLISHED;
-    document.publishTime = publishedAt;
-    if (dto.reviewerId) {
-      document.updateBy = this.toBigint(dto.reviewerId);
-    }
-
-    const saved = await this.dataSource.transaction(async (manager) => {
       await manager.save(document);
-      return manager.save(review);
+      await this.pipelineManagerService.publishDocument(
+        {
+          documentId: documentIdText,
+          contentId: document.contentId,
+          title: document.title,
+          publishedAt: publishedAt.toISOString(),
+        },
+        manager,
+      );
+      const saved = await manager.save(review);
+      return {
+        review: this.serialize(saved),
+        rebuilt: wasPublished,
+      };
     });
-    return {
-      review: this.serialize(saved),
-      rebuilt: wasPublished,
-    };
   }
 
   /** 已发布改为归档，并清掉向量索引、全文索引和图谱。正文仍留在库里。 */
-  async archive(documentId: string) {
-    const document = await this.findDocument(documentId);
-    if (document.status === DocumentStatus.ARCHIVED) {
-      throw new BadRequestException('文档已归档');
-    }
-    if (document.status !== DocumentStatus.PUBLISHED) {
-      throw new BadRequestException('只有已发布的文档可以归档');
-    }
+  async archive(documentId: string, viewer: DocumentViewer) {
+    return this.dataSource.transaction(async (manager) => {
+      await lockDocument(manager, documentId);
+      const document = await this.findDocument(documentId, manager);
+      this.requireEdit(viewer, document);
+      if (document.status === DocumentStatus.ARCHIVED) {
+        throw new BadRequestException('文档已归档');
+      }
+      if (document.status !== DocumentStatus.PUBLISHED) {
+        throw new BadRequestException('只有已发布的文档可以归档');
+      }
 
-    await this.pipelineManagerService.removeDocument(document.id.toString());
-    document.status = DocumentStatus.ARCHIVED;
-    const saved = await this.documentRepository.save(document);
-    return {
-      id: saved.id.toString(),
-      status: saved.status,
-    };
+      await this.pipelineManagerService.removeDocument(
+        document.id.toString(),
+        manager,
+      );
+      document.status = DocumentStatus.ARCHIVED;
+      const saved = await manager.save(document);
+      return {
+        id: saved.id.toString(),
+        status: saved.status,
+      };
+    });
   }
 
   /** 待审核列表，附带文档标题。 */
@@ -195,8 +232,10 @@ export class DocumentReviewService {
   }
 
   /** 一篇文档的审核记录，新的在前。 */
-  async listByDocument(documentId: string) {
+  async listByDocument(documentId: string, viewer: DocumentViewer) {
     const document = await this.findDocument(documentId);
+    if (!canViewDocument(viewer, toDocumentAccess(document)))
+      throw new NotFoundException('文档不存在');
     const rows = await this.reviewRepository.find({
       where: { documentId: document.id },
       order: { createdAt: 'DESC' },
@@ -210,19 +249,22 @@ export class DocumentReviewService {
   }
 
   /** 审核单必须是待审核，再用它上面的 documentId 去改文档。 */
-  private async findPendingReview(taskId: string) {
-    const review = await this.findReview(taskId);
+  private async findPendingReview(taskId: string, manager?: EntityManager) {
+    const review = await this.findReview(taskId, manager);
     if (review.reviewStatus !== ReviewStatus.PENDING) {
       throw new BadRequestException('该审核单不是待审核');
     }
     return review;
   }
 
-  private async findReview(taskId: string) {
+  private async findReview(
+    taskId: string,
+    manager = this.reviewRepository.manager,
+  ) {
     if (!/^\d+$/.test(taskId)) {
       throw new BadRequestException('审核 ID 无效');
     }
-    const review = await this.reviewRepository.findOne({
+    const review = await manager.findOne(DocumentReview, {
       where: { id: BigInt(taskId) },
     });
     if (!review) {
@@ -231,21 +273,19 @@ export class DocumentReviewService {
     return review;
   }
 
-  private findPending(documentId: bigint) {
-    return this.reviewRepository.findOne({
-      where: {
-        documentId,
-        reviewStatus: ReviewStatus.PENDING,
-      },
-      order: { createdAt: 'DESC' },
-    });
+  private requireEdit(viewer: DocumentViewer, document: Document) {
+    if (!canEditDocument(viewer, toDocumentAccess(document)))
+      throw new ForbiddenException('不能修改其他用户的文档');
   }
 
-  private async findDocument(id: string) {
+  private async findDocument(
+    id: string,
+    manager = this.documentRepository.manager,
+  ) {
     if (!/^\d+$/.test(id)) {
       throw new BadRequestException('文档 ID 无效');
     }
-    const document = await this.documentRepository.findOne({
+    const document = await manager.findOne(Document, {
       where: { id: BigInt(id), deleted: false },
     });
     if (!document) {
@@ -266,10 +306,6 @@ export class DocumentReviewService {
       titles.set(document.id.toString(), decodeUploadedText(document.title));
     }
     return titles;
-  }
-
-  private toBigint(value?: string) {
-    return value ? BigInt(value) : null;
   }
 
   private serialize(review: DocumentReview) {

@@ -1,5 +1,6 @@
 import {
   BadRequestException,
+  ForbiddenException,
   Injectable,
   NotFoundException,
   OnModuleInit,
@@ -8,9 +9,21 @@ import { InjectModel } from '@nestjs/mongoose';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Model, Types } from 'mongoose';
 import path from 'node:path';
-import { Repository } from 'typeorm';
+import { DataSource, Repository } from 'typeorm';
+import {
+  canEditDocument,
+  canViewDocument,
+  toDocumentAccess,
+  type DocumentViewer,
+} from './document-access.js';
+import { lockDocument } from './document-lock.js';
 import { decodeUploadedText } from './decode-uploaded-text.js';
-import { detectParser, parseToMarkdown, replaceImageRefs, type ParsedImage } from '../parser/index.js';
+import {
+  detectParser,
+  parseToMarkdown,
+  replaceImageRefs,
+  type ParsedImage,
+} from '../parser/index.js';
 import { PipelineManagerService } from '../pipelineManager/pipeline-manager.service.js';
 import { RustfsService, type SourceFile } from '../storage/rustfs.service.js';
 import { DocumentStatus } from './document-status.js';
@@ -33,6 +46,7 @@ export class DocumentService implements OnModuleInit {
     private readonly documentRepository: Repository<Document>,
     private readonly rustfsService: RustfsService,
     private readonly pipelineManagerService: PipelineManagerService,
+    private readonly dataSource: DataSource,
   ) {}
 
   /**
@@ -86,61 +100,77 @@ export class DocumentService implements OnModuleInit {
     }
   }
 
-  async create(createDocumentDto: CreateDocumentDto) {
+  async create(createDocumentDto: CreateDocumentDto, viewer: DocumentViewer) {
+    this.requireDraft(createDocumentDto.status);
     return this.storeDocument({
       markdown: createDocumentDto.content ?? '',
       title: createDocumentDto.title,
       summary: createDocumentDto.summary ?? '',
       categoryId: createDocumentDto.categoryId,
       teamId: createDocumentDto.teamId,
-      authorId: createDocumentDto.authorId,
+      authorId: viewer.userId,
       coverImage: createDocumentDto.coverImage,
       tags: createDocumentDto.tags,
-      status: createDocumentDto.status,
+      status: DocumentStatus.DRAFT,
       remark: createDocumentDto.remark,
-      publishTime: createDocumentDto.publishTime,
       isPublic: createDocumentDto.isPublic,
-      createBy: createDocumentDto.createBy,
+      createBy: viewer.userId,
     });
   }
 
-  async publish(documentId: string) {
-    if (!/^\d+$/.test(documentId)) {
-      throw new BadRequestException('文档 ID 无效');
-    }
+  async publish(documentId: string, viewer: DocumentViewer) {
+    return this.dataSource.transaction(async (manager) => {
+      await lockDocument(manager, documentId);
+      if (!/^\d+$/.test(documentId)) {
+        throw new BadRequestException('文档 ID 无效');
+      }
 
-    const document = await this.documentRepository.findOne({
-      where: { id: BigInt(documentId), deleted: false },
+      const document = await manager.findOne(Document, {
+        where: { id: BigInt(documentId), deleted: false },
+      });
+      if (!document) {
+        throw new NotFoundException('文档不存在');
+      }
+      this.requireEdit(viewer, document);
+      if (document.status === DocumentStatus.PENDING_REVIEW) {
+        return { message: '文档正在审核，不能直接发布' };
+      }
+      if (document.status === DocumentStatus.PUBLISHED) {
+        return { message: '文档已发布' };
+      }
+
+      const publishedAt = new Date();
+      document.title = decodeUploadedText(document.title);
+      // Reviewers can approve through the review workflow; owners cannot bypass it.
+      if (!viewer.roles.includes('ROLE_ADMIN')) {
+        throw new ForbiddenException('请提交审核后发布');
+      }
+      document.status = DocumentStatus.PUBLISHED;
+      document.publishTime = publishedAt;
+      const saved = await manager.save(document);
+      await this.pipelineManagerService.publishDocument(
+        {
+          documentId: document.id.toString(),
+          contentId: document.contentId,
+          title: document.title,
+          publishedAt: publishedAt.toISOString(),
+        },
+        manager,
+      );
+
+      return {
+        message: '发布成功',
+        document: this.serializeDocument(saved),
+      };
     });
-    if (!document) {
-      return { message: '文档不存在' };
-    }
-    if (document.status === DocumentStatus.PENDING_REVIEW) {
-      return { message: '文档正在审核，不能直接发布' };
-    }
-    if (document.status === DocumentStatus.PUBLISHED) {
-      return { message: '文档已发布' };
-    }
-
-    const publishedAt = new Date();
-    document.title = decodeUploadedText(document.title);
-    await this.pipelineManagerService.publishDocument({
-      documentId: document.id.toString(),
-      contentId: document.contentId,
-      title: document.title,
-      publishedAt: publishedAt.toISOString(),
-    });
-    document.status = DocumentStatus.PUBLISHED;
-    document.publishTime = publishedAt;
-    const saved = await this.documentRepository.save(document);
-
-    return {
-      message: '发布成功',
-      document: this.serializeDocument(saved),
-    };
   }
 
-  async parseUpload(file: SourceFile, parseUploadDto: ParseUploadDto) {
+  async parseUpload(
+    file: SourceFile,
+    parseUploadDto: ParseUploadDto,
+    viewer: DocumentViewer,
+  ) {
+    this.requireDraft(parseUploadDto.status);
     if (!file?.buffer?.length) {
       throw new BadRequestException('文件不能为空');
     }
@@ -155,7 +185,9 @@ export class DocumentService implements OnModuleInit {
     }
 
     const parsed = await parseToMarkdown(parser, file.buffer);
-    const markdown = (await this.mountImages(parsed.markdown, parsed.images)).trim();
+    const markdown = (
+      await this.mountImages(parsed.markdown, parsed.images)
+    ).trim();
     if (!markdown) {
       throw new BadRequestException('文件内容为空');
     }
@@ -168,13 +200,13 @@ export class DocumentService implements OnModuleInit {
       summary: parseUploadDto.summary?.trim() || this.extractSummary(markdown),
       categoryId: parseUploadDto.categoryId,
       teamId: parseUploadDto.teamId,
-      authorId: parseUploadDto.authorId,
+      authorId: viewer.userId,
       coverImage: parseUploadDto.coverImage,
       tags: parseUploadDto.tags,
-      status: parseUploadDto.status,
+      status: DocumentStatus.DRAFT,
       remark: parseUploadDto.remark ?? originalname,
       isPublic: parseUploadDto.isPublic,
-      createBy: parseUploadDto.createBy,
+      createBy: viewer.userId,
       sourceFile: namedFile,
     });
   }
@@ -308,11 +340,13 @@ export class DocumentService implements OnModuleInit {
     };
   }
 
-  async findAll() {
-    const documents = await this.documentRepository.find({
-      where: { deleted: false },
-      order: { createdAt: 'DESC' },
-    });
+  async findAll(viewer: DocumentViewer) {
+    const documents = (
+      await this.documentRepository.find({
+        where: { deleted: false },
+        order: { createdAt: 'DESC' },
+      })
+    ).filter((row) => canViewDocument(viewer, toDocumentAccess(row)));
     if (documents.length === 0) {
       return [];
     }
@@ -338,8 +372,11 @@ export class DocumentService implements OnModuleInit {
     }));
   }
 
-  async findOne(id: string) {
+  async findOne(id: string, viewer: DocumentViewer) {
     const document = await this.findDocument(id);
+    if (!canViewDocument(viewer, toDocumentAccess(document))) {
+      throw new NotFoundException('文档不存在');
+    }
     const content = await this.findContent(document.contentId, false);
 
     return {
@@ -348,100 +385,162 @@ export class DocumentService implements OnModuleInit {
     };
   }
 
-  async update(id: string, updateDocumentDto: UpdateDocumentDto) {
-    const document = await this.findDocument(id);
+  async update(
+    id: string,
+    updateDocumentDto: UpdateDocumentDto,
+    viewer: DocumentViewer,
+  ) {
+    let newContentId: string | undefined;
+    try {
+      return await this.dataSource.transaction(async (manager) => {
+        await lockDocument(manager, id);
+        const document = await this.findDocument(id, false, manager);
+        this.requireEdit(viewer, document);
+        if (document.status === DocumentStatus.PENDING_REVIEW) {
+          throw new BadRequestException('审核中的文档不能修改');
+        }
+        if (
+          updateDocumentDto.status !== undefined &&
+          updateDocumentDto.status !== document.status
+        ) {
+          throw new BadRequestException('请通过审核、发布或归档接口修改状态');
+        }
+        if (
+          updateDocumentDto.authorId !== undefined &&
+          updateDocumentDto.authorId !== document.authorId?.toString()
+        ) {
+          throw new BadRequestException('不能修改文档作者');
+        }
+        if (updateDocumentDto.publishTime !== undefined) {
+          throw new BadRequestException('发布时间由服务端设置');
+        }
+        const changesEvidence =
+          updateDocumentDto.content !== undefined ||
+          updateDocumentDto.title !== undefined ||
+          updateDocumentDto.summary !== undefined;
+        if (document.status === DocumentStatus.PUBLISHED && changesEvidence) {
+          document.status = DocumentStatus.DRAFT;
+          await this.pipelineManagerService.removeDocument(id, manager);
+        }
 
-    if (updateDocumentDto.title !== undefined) {
-      document.title = updateDocumentDto.title;
-    }
-    if (updateDocumentDto.summary !== undefined) {
-      document.summary = updateDocumentDto.summary;
-    }
-    if (updateDocumentDto.categoryId !== undefined) {
-      document.categoryId = this.toBigint(updateDocumentDto.categoryId);
-    }
-    if (updateDocumentDto.teamId !== undefined) {
-      document.teamId = this.toBigint(updateDocumentDto.teamId);
-    }
-    if (updateDocumentDto.authorId !== undefined) {
-      document.authorId = this.toBigint(updateDocumentDto.authorId);
-    }
-    if (updateDocumentDto.coverImage !== undefined) {
-      document.coverImage = updateDocumentDto.coverImage;
-    }
-    if (updateDocumentDto.tags !== undefined) {
-      document.tags = updateDocumentDto.tags;
-    }
-    if (updateDocumentDto.status !== undefined) {
-      document.status = updateDocumentDto.status;
-    }
-    if (updateDocumentDto.remark !== undefined) {
-      document.remark = updateDocumentDto.remark;
-    }
-    if (updateDocumentDto.isPublic !== undefined) {
-      document.isPublic = updateDocumentDto.isPublic;
-    }
-    if (updateDocumentDto.publishTime !== undefined) {
-      document.publishTime = new Date(updateDocumentDto.publishTime);
-    }
-    if (updateDocumentDto.updateBy !== undefined) {
-      document.updateBy = this.toBigint(updateDocumentDto.updateBy);
-    }
+        if (updateDocumentDto.title !== undefined) {
+          document.title = updateDocumentDto.title;
+        }
+        if (updateDocumentDto.summary !== undefined) {
+          document.summary = updateDocumentDto.summary;
+        }
+        if (updateDocumentDto.categoryId !== undefined) {
+          document.categoryId = this.toBigint(updateDocumentDto.categoryId);
+        }
+        if (updateDocumentDto.teamId !== undefined) {
+          document.teamId = this.toBigint(updateDocumentDto.teamId);
+        }
+        if (updateDocumentDto.coverImage !== undefined) {
+          document.coverImage = updateDocumentDto.coverImage;
+        }
+        if (updateDocumentDto.tags !== undefined) {
+          document.tags = updateDocumentDto.tags;
+        }
+        if (updateDocumentDto.remark !== undefined) {
+          document.remark = updateDocumentDto.remark;
+        }
+        if (updateDocumentDto.isPublic !== undefined) {
+          document.isPublic = updateDocumentDto.isPublic;
+        }
+        document.updateBy = BigInt(viewer.userId);
 
-    const contentUpdate: {
-      content?: string;
-      length?: number;
-      contentSummary?: string;
-    } = {};
-    if (updateDocumentDto.content !== undefined) {
-      contentUpdate.content = updateDocumentDto.content;
-      contentUpdate.length = updateDocumentDto.content.length;
-      document.wordCount = updateDocumentDto.content.length;
+        const contentUpdate: {
+          content?: string;
+          length?: number;
+          contentSummary?: string;
+        } = {};
+        if (updateDocumentDto.content !== undefined) {
+          contentUpdate.content = updateDocumentDto.content;
+          contentUpdate.length = updateDocumentDto.content.length;
+          document.wordCount = updateDocumentDto.content.length;
+        }
+        if (updateDocumentDto.summary !== undefined) {
+          contentUpdate.contentSummary = updateDocumentDto.summary;
+        }
+        if (changesEvidence) {
+          const previous = await this.findContent(document.contentId, false);
+          const body = await this.documentContentModel.create({
+            content: contentUpdate.content ?? previous?.content ?? '',
+            length: contentUpdate.length ?? previous?.length ?? 0,
+            contentSummary:
+              contentUpdate.contentSummary ?? previous?.contentSummary ?? '',
+            deleted: false,
+          });
+          document.contentId = body._id.toString();
+          newContentId = document.contentId;
+        }
+
+        const saved = await manager.save(document);
+        const content = await this.findContent(document.contentId);
+
+        return {
+          document: this.serializeDocument(saved),
+          content: this.serializeContent(content),
+        };
+      });
+    } catch (error) {
+      if (newContentId) {
+        await this.documentContentModel
+          .deleteOne({ _id: newContentId })
+          .catch(() => undefined);
+      }
+      throw error;
     }
-    if (updateDocumentDto.summary !== undefined) {
-      contentUpdate.contentSummary = updateDocumentDto.summary;
-    }
-    if (
-      Object.keys(contentUpdate).length > 0 &&
-      Types.ObjectId.isValid(document.contentId)
-    ) {
-      await this.documentContentModel.updateOne(
-        { _id: document.contentId },
-        { $set: contentUpdate },
+  }
+
+  async remove(deleteDocumentDto: DeleteDocumentDto, viewer: DocumentViewer) {
+    return this.dataSource.transaction(async (manager) => {
+      await lockDocument(manager, deleteDocumentDto.id);
+      const document = await this.findDocument(
+        deleteDocumentDto.id,
+        true,
+        manager,
       );
-    }
+      this.requireEdit(viewer, document);
+      const contentId = document.contentId;
 
-    const saved = await this.documentRepository.save(document);
-    const content = await this.findContent(document.contentId);
+      await this.pipelineManagerService.removeDocument(
+        document.id.toString(),
+        manager,
+      );
+      // Keep the body until asynchronous index cleanup has finished.
+      document.deleted = true;
+      await manager.save(document);
 
-    return {
-      document: this.serializeDocument(saved),
-      content: this.serializeContent(content),
-    };
+      return {
+        id: document.id.toString(),
+        contentId,
+      };
+    });
   }
 
-  async remove(deleteDocumentDto: DeleteDocumentDto) {
-    const document = await this.findDocument(deleteDocumentDto.id, true);
-    const contentId = document.contentId;
-
-    await this.pipelineManagerService.removeDocument(document.id.toString());
-    if (Types.ObjectId.isValid(contentId)) {
-      await this.documentContentModel.deleteOne({ _id: contentId });
+  private requireDraft(status?: number) {
+    if (status !== undefined && status !== DocumentStatus.DRAFT) {
+      throw new BadRequestException('新文档必须从草稿开始');
     }
-    await this.documentRepository.delete({ id: document.id });
-
-    return {
-      id: document.id.toString(),
-      contentId,
-    };
   }
 
-  private async findDocument(id: string, includeDeleted = false) {
+  private requireEdit(viewer: DocumentViewer, document: Document) {
+    if (!canEditDocument(viewer, toDocumentAccess(document))) {
+      throw new ForbiddenException('不能修改其他用户的文档');
+    }
+  }
+
+  private async findDocument(
+    id: string,
+    includeDeleted = false,
+    manager = this.documentRepository.manager,
+  ) {
     if (!/^\d+$/.test(id)) {
       throw new BadRequestException('文档 ID 无效');
     }
 
-    const document = await this.documentRepository.findOne({
+    const document = await manager.findOne(Document, {
       where: {
         id: BigInt(id),
         ...(includeDeleted ? {} : { deleted: false }),

@@ -7,9 +7,13 @@ import {
   Patch,
   Post,
   Put,
+  Req,
   UploadedFile,
   UseInterceptors,
 } from '@nestjs/common';
+import type { Request } from 'express';
+import type { UserProfile } from '../user/user.service.js';
+import { documentViewer } from './document-access.js';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { PermissionCode } from '../permission/permission-code.js';
 import { Permissions } from '../permission/permissions.decorator.js';
@@ -18,7 +22,6 @@ import { DocumentService } from './document.service.js';
 import { CreateDocumentDto } from './dto/create-document.dto.js';
 import { DeleteDocumentDto } from './dto/delete-document.dto.js';
 import { ParseUploadDto } from './dto/parse-upload.dto.js';
-import { PublishDocumentDto } from './dto/publish-document.dto.js';
 import { UpdateDocumentDto } from './dto/update-document.dto.js';
 
 @Controller('documents')
@@ -27,50 +30,78 @@ export class DocumentController {
 
   @Permissions(PermissionCode.DOCUMENT_CREATE)
   @Post()
-  create(@Body() createDocumentDto: CreateDocumentDto) {
-    return this.documentService.create(createDocumentDto);
+  create(
+    @Req() request: Request & { user: UserProfile },
+    @Body() createDocumentDto: CreateDocumentDto,
+  ) {
+    return this.documentService.create(
+      createDocumentDto,
+      documentViewer(request.user),
+    );
   }
 
   @Permissions(PermissionCode.DOCUMENT_CREATE)
   @Post('upload/parse')
   @UseInterceptors(FileInterceptor('file', { defParamCharset: 'utf8' }))
   parseUpload(
+    @Req() request: Request & { user: UserProfile },
     @UploadedFile() file: SourceFile,
     @Body() parseUploadDto: ParseUploadDto,
   ) {
-    return this.documentService.parseUpload(file, parseUploadDto);
+    return this.documentService.parseUpload(
+      file,
+      parseUploadDto,
+      documentViewer(request.user),
+    );
   }
 
   @Permissions(PermissionCode.DOCUMENT_EDIT)
   @Put(':id/publish')
-  publish(@Param('id') id: string) {
-    return this.documentService.publish(id);
+  publish(
+    @Req() request: Request & { user: UserProfile },
+    @Param('id') id: string,
+  ) {
+    return this.documentService.publish(id, documentViewer(request.user));
   }
 
   @Permissions(PermissionCode.DOCUMENT, PermissionCode.DOCUMENT_LIST)
   @Get()
-  findAll() {
-    return this.documentService.findAll();
+  findAll(@Req() request: Request & { user: UserProfile }) {
+    return this.documentService.findAll(documentViewer(request.user));
   }
 
   @Permissions(PermissionCode.DOCUMENT, PermissionCode.DOCUMENT_LIST)
   @Get(':id')
-  findOne(@Param('id') id: string) {
-    return this.documentService.findOne(id);
+  findOne(
+    @Req() request: Request & { user: UserProfile },
+    @Param('id') id: string,
+  ) {
+    return this.documentService.findOne(id, documentViewer(request.user));
   }
 
   @Permissions(PermissionCode.DOCUMENT_EDIT)
   @Patch(':id')
   update(
+    @Req() request: Request & { user: UserProfile },
     @Param('id') id: string,
     @Body() updateDocumentDto: UpdateDocumentDto,
   ) {
-    return this.documentService.update(id, updateDocumentDto);
+    return this.documentService.update(
+      id,
+      updateDocumentDto,
+      documentViewer(request.user),
+    );
   }
 
   @Permissions(PermissionCode.DOCUMENT_DELETE)
   @Delete()
-  remove(@Body() deleteDocumentDto: DeleteDocumentDto) {
-    return this.documentService.remove(deleteDocumentDto);
+  remove(
+    @Req() request: Request & { user: UserProfile },
+    @Body() deleteDocumentDto: DeleteDocumentDto,
+  ) {
+    return this.documentService.remove(
+      deleteDocumentDto,
+      documentViewer(request.user),
+    );
   }
 }

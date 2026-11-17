@@ -1,4 +1,5 @@
 import type { HybridHitView } from './ai.view.js';
+import { runAgentOperation } from './agent-runtime.js';
 
 const BOCHA_URL = 'https://api.bochaai.com/v1/web-search';
 const QUERY_LIMIT = 200;
@@ -62,26 +63,28 @@ export async function searchBocha(
   const key = process.env.BOCHA_API_KEY?.trim();
   if (!key) throw new Error('博查搜索未配置');
   const timeout = AbortSignal.timeout(20_000);
-  const response = await fetch(BOCHA_URL, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${key}`,
-      'Content-Type': 'application/json',
-      Accept: 'application/json',
-    },
-    body: JSON.stringify({
-      query: clip(query, QUERY_LIMIT),
-      freshness: 'noLimit',
-      summary: true,
-      count: Math.min(PAGE_LIMIT, Math.max(1, limit)),
-    }),
-    signal: AbortSignal.any([signal, timeout]),
+  return runAgentOperation(async (operationSignal) => {
+    const response = await fetch(BOCHA_URL, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${key}`,
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      },
+      body: JSON.stringify({
+        query: clip(query, QUERY_LIMIT),
+        freshness: 'noLimit',
+        summary: true,
+        count: Math.min(PAGE_LIMIT, Math.max(1, limit)),
+      }),
+      signal: AbortSignal.any([signal, timeout, operationSignal]),
+    });
+    if (!response.ok) throw new Error('博查搜索失败');
+    return bochaPassages(
+      await response.json(),
+      Math.min(PAGE_LIMIT, Math.max(1, limit)),
+    );
   });
-  if (!response.ok) throw new Error('博查搜索失败');
-  return bochaPassages(
-    await response.json(),
-    Math.min(PAGE_LIMIT, Math.max(1, limit)),
-  );
 }
 
 function readPages(payload: unknown) {

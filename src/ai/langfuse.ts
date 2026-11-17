@@ -33,7 +33,8 @@ let enabled = false;
 export function enableLangfuse() {
   const publicKey = process.env.LANGFUSE_PUBLIC_KEY?.trim() ?? '';
   const secretKey = process.env.LANGFUSE_SECRET_KEY?.trim() ?? '';
-  const baseUrl = process.env.LANGFUSE_BASE_URL?.trim() || 'https://cloud.langfuse.com';
+  const baseUrl =
+    process.env.LANGFUSE_BASE_URL?.trim() || 'https://cloud.langfuse.com';
   if (!publicKey || !secretKey) {
     console.log('[Langfuse] 未配置公钥或私钥，查找链路不会上报');
     return false;
@@ -41,7 +42,12 @@ export function enableLangfuse() {
   process.env.LANGFUSE_PUBLIC_KEY = publicKey;
   process.env.LANGFUSE_SECRET_KEY = secretKey;
   process.env.LANGFUSE_BASE_URL = baseUrl;
-  processor = new LangfuseSpanProcessor({ publicKey, secretKey, baseUrl, timeout: 20 });
+  processor = new LangfuseSpanProcessor({
+    publicKey,
+    secretKey,
+    baseUrl,
+    timeout: 20,
+  });
   const sdk = new NodeSDK({ spanProcessors: [processor] });
   sdk.start();
   registerTelemetry(new LangfuseVercelAiSdkIntegration());
@@ -94,10 +100,12 @@ export function openLangfuseTrace(
       try {
         opened.update({
           output: outputs,
-          ...(error === undefined ? {} : { level: 'ERROR' as const, statusMessage: errorText(error) }),
+          ...(error === undefined
+            ? {}
+            : { level: 'ERROR' as const, statusMessage: errorText(error) }),
         });
         opened.end();
-        await processor?.forceFlush();
+        void processor?.forceFlush().catch(report);
       } catch (flushError) {
         report(flushError);
       }
@@ -114,12 +122,22 @@ export async function runLangfuseSpan<T>(
   outputs: (value: T) => Record<string, unknown>,
 ): Promise<T> {
   return context.with(parent, async () => {
-    const child = startChild(name, runType, inputs);
+    let child: FuseNode;
+    try {
+      child = startChild(name, runType, inputs);
+    } catch (error) {
+      report(error);
+      return fn();
+    }
     const childContext = trace.setSpan(context.active(), child.otelSpan);
     try {
       const value = await context.with(childContext, fn);
-      child.update({ output: outputs(value) });
-      child.end();
+      try {
+        child.update({ output: outputs(value) });
+        child.end();
+      } catch (error) {
+        report(error);
+      }
       return value;
     } catch (error) {
       try {
@@ -133,9 +151,15 @@ export async function runLangfuseSpan<T>(
   });
 }
 
-function startChild(name: string, runType: 'chain' | 'retriever' | 'llm', input: Record<string, unknown>): FuseNode {
-  if (runType === 'retriever') return startObservation(name, { input }, { asType: 'retriever' });
-  if (runType === 'llm') return startObservation(name, { input }, { asType: 'generation' });
+function startChild(
+  name: string,
+  runType: 'chain' | 'retriever' | 'llm',
+  input: Record<string, unknown>,
+): FuseNode {
+  if (runType === 'retriever')
+    return startObservation(name, { input }, { asType: 'retriever' });
+  if (runType === 'llm')
+    return startObservation(name, { input }, { asType: 'generation' });
   return startObservation(name, { input }, { asType: 'chain' });
 }
 

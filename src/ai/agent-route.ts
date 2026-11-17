@@ -1,5 +1,6 @@
 import { tracedGenerateText } from './langsmith.js';
 import { createChatModel } from './chat-model.js';
+import { throwIfRunStopped } from './agent-runtime.js';
 
 /**
  * 一轮提问的意图。工具是否可用由代码决定，模型只负责分类和给出检索词。
@@ -10,7 +11,12 @@ import { createChatModel } from './chat-model.js';
  * web：公开信息或用户明确要求查互联网。用博查检索。
  * knowledge_then_web：先查知识库。没有切题资料时再联网，第一次没有任何资料就不再改写。
  */
-export type AgentIntent = 'chat' | 'preference' | 'knowledge' | 'web' | 'knowledge_then_web';
+export type AgentIntent =
+  | 'chat'
+  | 'preference'
+  | 'knowledge'
+  | 'web'
+  | 'knowledge_then_web';
 
 export type RouteDecision = {
   intent: AgentIntent;
@@ -18,7 +24,13 @@ export type RouteDecision = {
   query: string;
 };
 
-const INTENTS: AgentIntent[] = ['chat', 'preference', 'knowledge', 'web', 'knowledge_then_web'];
+const INTENTS: AgentIntent[] = [
+  'chat',
+  'preference',
+  'knowledge',
+  'web',
+  'knowledge_then_web',
+];
 
 export const INTENT_LABEL: Record<AgentIntent, string> = {
   chat: '闲聊',
@@ -31,8 +43,10 @@ export const INTENT_LABEL: Record<AgentIntent, string> = {
 /** 模型没给出合法意图时按知识库处理，避免漏查规定。 */
 export function parseRoute(raw: string, fallbackQuery: string): RouteDecision {
   const parsed = readJson(raw);
-  const intent = parsed && typeof parsed.intent === 'string' ? parsed.intent : '';
-  const query = parsed && typeof parsed.query === 'string' ? parsed.query.trim() : '';
+  const intent =
+    parsed && typeof parsed.intent === 'string' ? parsed.intent : '';
+  const query =
+    parsed && typeof parsed.query === 'string' ? parsed.query.trim() : '';
   if (!INTENTS.includes(intent as AgentIntent)) {
     return { intent: 'knowledge', query: clip(fallbackQuery, 80) };
   }
@@ -43,7 +57,11 @@ export function parseRoute(raw: string, fallbackQuery: string): RouteDecision {
 }
 
 /** 结合上文判断这一问该不该查知识库，并给出检索词。失败时退回知识库意图。 */
-export async function routeQuestion(question: string, memory: string, longTerm: string) {
+export async function routeQuestion(
+  question: string,
+  memory: string,
+  longTerm: string,
+) {
   try {
     const { text } = await tracedGenerateText({
       model: createChatModel(),
@@ -67,7 +85,8 @@ export async function routeQuestion(question: string, memory: string, longTerm: 
         .join('\n\n'),
     });
     return parseRoute(text, question);
-  } catch {
+  } catch (error) {
+    throwIfRunStopped(error);
     return { intent: 'knowledge' as const, query: clip(question, 80) };
   }
 }
@@ -77,7 +96,10 @@ function readJson(raw: string): { intent?: unknown; query?: unknown } | null {
   const end = raw.lastIndexOf('}');
   if (start < 0 || end <= start) return null;
   try {
-    return JSON.parse(raw.slice(start, end + 1)) as { intent?: unknown; query?: unknown };
+    return JSON.parse(raw.slice(start, end + 1)) as {
+      intent?: unknown;
+      query?: unknown;
+    };
   } catch {
     return null;
   }

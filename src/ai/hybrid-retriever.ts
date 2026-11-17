@@ -2,6 +2,7 @@ import { Logger } from '@nestjs/common';
 import type { Client } from '@elastic/elasticsearch';
 import { createEmbeddings } from '../pipelineManager/embedding.js';
 import { getChunkIndexTarget } from '../pipelineManager/vector-index.js';
+import { runAgentOperation, throwIfRunStopped } from './agent-runtime.js';
 
 const logger = new Logger('HybridRetriever');
 
@@ -38,77 +39,118 @@ type ChunkSource = {
 };
 
 /** 关键词和向量各查一路，按 chunkId 做倒数排名融合。索引不存在时返回空数组。阅读权限不在索引里判断，由调用方按文档记录过滤。 */
-export async function retrieveChunks(question: string, limit: number) {
+export async function retrieveChunks(
+  question: string,
+  limit: number,
+  contentIds?: string[],
+) {
+  if (contentIds?.length === 0) return [];
   const target = getChunkIndexTarget();
   if (!target) {
     throw new Error('向量索引未启用');
   }
 
-  const exists = await target.client.indices.exists({ index: target.index });
+  const exists = await runAgentOperation((signal) =>
+    target.client.indices.exists({ index: target.index }, { signal }),
+  );
   if (!exists) {
     return [];
   }
 
-  const [keyword, vector] = await Promise.all([
-    searchKeyword(target.client, target.index, question),
-    searchVector(target.client, target.index, question),
+  const results = await Promise.allSettled([
+    searchKeyword(target.client, target.index, question, contentIds),
+    searchVector(target.client, target.index, question, contentIds),
   ]);
+  throwIfRunStopped();
+  if (results.every((result) => result.status === 'rejected')) {
+    throw new AggregateError(
+      results.map((result) =>
+        result.status === 'rejected' ? result.reason : undefined,
+      ),
+      'All retrieval channels failed',
+    );
+  }
+  const [keyword, vector] = results.map((result) => {
+    if (result.status === 'fulfilled') return result.value;
+    logger.warn('Retrieval channel unavailable');
+    return [];
+  });
+  if (
+    keyword.length + vector.length === 0 &&
+    results.some((result) => result.status === 'rejected')
+  ) {
+    throw new Error('Retrieval degraded without usable evidence');
+  }
   return fuse(keyword, vector).slice(0, limit);
 }
 
-async function searchKeyword(client: Client, index: string, question: string) {
-  try {
-    const result = await client.search<ChunkSource>({
-      index,
-      size: CANDIDATES,
-      query: {
-        multi_match: {
-          query: question,
-          fields: ['title^2', 'chapter', 'content'],
-          type: 'best_fields',
-          analyzer: COARSE_ANALYZER,
-          fuzziness: 'AUTO',
-          prefix_length: 1,
-          operator: 'or',
+async function searchKeyword(
+  client: Client,
+  index: string,
+  question: string,
+  contentIds?: string[],
+) {
+  const result = await runAgentOperation((signal) =>
+    client.search<ChunkSource>(
+      {
+        index,
+        size: CANDIDATES,
+        query: {
+          bool: {
+            filter: contentIds ? [{ terms: { contentId: contentIds } }] : [],
+            must: [
+              {
+                multi_match: {
+                  query: question,
+                  fields: ['title^2', 'chapter', 'content'],
+                  type: 'best_fields',
+                  analyzer: COARSE_ANALYZER,
+                  fuzziness: 'AUTO',
+                  prefix_length: 1,
+                  operator: 'or',
+                },
+              },
+            ],
+          },
         },
       },
-    });
-    return result.hits.hits.map((hit) => hit._source);
-  } catch (error) {
-    logger.error(
-      '关键词检索失败',
-      error instanceof Error ? error.message : String(error),
-    );
-    return [];
-  }
+      { signal },
+    ),
+  );
+  return result.hits.hits.map((hit) => hit._source);
 }
 
-async function searchVector(client: Client, index: string, question: string) {
-  try {
-    const vector = await createEmbeddings().embedQuery(question);
-    const result = await client.search<ChunkSource>({
-      index,
-      size: CANDIDATES,
-      knn: {
-        field: 'embedding',
-        query_vector: vector,
-        k: CANDIDATES,
-        num_candidates: CANDIDATES * 5,
+async function searchVector(
+  client: Client,
+  index: string,
+  question: string,
+  contentIds?: string[],
+) {
+  const vector = await runAgentOperation((signal) =>
+    createEmbeddings(signal).embedQuery(question),
+  );
+  const result = await runAgentOperation((signal) =>
+    client.search<ChunkSource>(
+      {
+        index,
+        size: CANDIDATES,
+        knn: {
+          field: 'embedding',
+          query_vector: vector,
+          k: CANDIDATES,
+          num_candidates: CANDIDATES * 5,
+          filter: contentIds ? { terms: { contentId: contentIds } } : undefined,
+        },
       },
-    });
-    return result.hits.hits.flatMap((hit) => {
-      if (!hit._source || (hit._score ?? 0) < VECTOR_MIN_SCORE) {
-        return [];
-      }
-      return [hit._source];
-    });
-  } catch (error) {
-    logger.error(
-      '向量检索失败',
-      error instanceof Error ? error.message : String(error),
-    );
-    return [];
-  }
+      { signal },
+    ),
+  );
+  return result.hits.hits.flatMap((hit) => {
+    if (!hit._source || (hit._score ?? 0) < VECTOR_MIN_SCORE) {
+      return [];
+    }
+    return [hit._source];
+  });
 }
 
 function fuse(

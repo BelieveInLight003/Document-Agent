@@ -34,5 +34,12 @@ export class ChatSchemaService implements OnModuleInit {
       CREATE INDEX IF NOT EXISTS idx_kh_chat_message_session_id
         ON kh_chat_message (session_id, created_at, id)
     `);
+    await this.dataSource.query(`
+      CREATE TABLE IF NOT EXISTS kh_chat_run (
+        session_id BIGINT PRIMARY KEY REFERENCES kh_chat_session(id) ON DELETE CASCADE,
+        token UUID NOT NULL,
+        expires_at TIMESTAMPTZ NOT NULL
+      )
+    `);
   }
 }

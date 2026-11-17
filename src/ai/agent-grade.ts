@@ -4,12 +4,18 @@ import type { ChatSource } from './chat-step.js';
 import { tracedGenerateText } from './langsmith.js';
 import { materialHeading } from './prompt.js';
 import { createChatModel } from './chat-model.js';
+import { throwIfRunStopped } from './agent-runtime.js';
 
 /**
  * 一组检索结果和问题是否同一主题。
  * 只有 sufficient 能进入回答。其余三档都只说明为什么不够，不能当依据。
  */
-export type GradeLabel = 'sufficient' | 'partial' | 'irrelevant' | 'empty';
+export type GradeLabel =
+  | 'sufficient'
+  | 'partial'
+  | 'irrelevant'
+  | 'empty'
+  | 'unavailable';
 
 export type GradeDecision = {
   grade: GradeLabel;
@@ -21,6 +27,7 @@ export const GRADE_LABEL: Record<GradeLabel, string> = {
   partial: '部分相关，信息不足',
   irrelevant: '不切题',
   empty: '没有检索到资料',
+  unavailable: '评估暂时不可用',
 };
 
 /** 解析失败时不当成切题，避免把没评估过的资料送进回答。 */
@@ -28,27 +35,41 @@ export function parseGrade(raw: string): GradeDecision {
   const start = raw.indexOf('{');
   const end = raw.lastIndexOf('}');
   if (start < 0 || end <= start) {
-    return { grade: 'partial', reason: '没能完成评估' };
+    return { grade: 'unavailable', reason: '没能完成评估' };
   }
   try {
-    const parsed = JSON.parse(raw.slice(start, end + 1)) as { grade?: unknown; reason?: unknown };
+    const parsed = JSON.parse(raw.slice(start, end + 1)) as {
+      grade?: unknown;
+      reason?: unknown;
+    };
     const grade = parsed.grade;
-    const reason = typeof parsed.reason === 'string' ? parsed.reason.trim() : '';
-    if (grade === 'sufficient' || grade === 'partial' || grade === 'irrelevant' || grade === 'empty') {
+    const reason =
+      typeof parsed.reason === 'string' ? parsed.reason.trim() : '';
+    if (
+      grade === 'sufficient' ||
+      grade === 'partial' ||
+      grade === 'irrelevant' ||
+      grade === 'empty'
+    ) {
       return { grade, reason: clip(reason || GRADE_LABEL[grade], 200) };
     }
   } catch {
     // 落到下面的保守结果
   }
-  return { grade: 'partial', reason: '没能完成评估' };
+  return { grade: 'unavailable', reason: '没能完成评估' };
 }
 
 /** 有资料才调用模型。评估失败按部分相关处理，随后可以改写重查。 */
-export async function gradeHits(question: string, items: HybridHitView[]): Promise<GradeDecision> {
+export async function gradeHits(
+  question: string,
+  items: HybridHitView[],
+): Promise<GradeDecision> {
   if (items.length === 0) {
     return { grade: 'empty', reason: GRADE_LABEL.empty };
   }
-  const passages = items.map((item, index) => `${materialHeading(item, index)}\n${item.content}`).join('\n\n');
+  const passages = items
+    .map((item, index) => `${materialHeading(item, index)}\n${item.content}`)
+    .join('\n\n');
   try {
     const { text } = await tracedGenerateText({
       model: createChatModel(),
@@ -69,8 +90,9 @@ export async function gradeHits(question: string, items: HybridHitView[]): Promi
       prompt: `问题：\n${question}\n\n资料：\n${passages}`,
     });
     return parseGrade(text);
-  } catch {
-    return { grade: 'partial', reason: '评估暂时不可用' };
+  } catch (error) {
+    throwIfRunStopped(error);
+    return { grade: 'unavailable', reason: '评估暂时不可用' };
   }
 }
 
@@ -78,7 +100,11 @@ export async function gradeHits(question: string, items: HybridHitView[]): Promi
  * 根据原问题、上次检索词和不够的原因，换成更像制度标题的检索词。
  * 失败或结果为空时返回空字符串，调用方停止重查。
  */
-export async function rewriteSearchQuery(question: string, query: string, reason: string) {
+export async function rewriteSearchQuery(
+  question: string,
+  query: string,
+  reason: string,
+) {
   try {
     const { text } = await tracedGenerateText({
       model: createChatModel(),
@@ -95,7 +121,8 @@ export async function rewriteSearchQuery(question: string, query: string, reason
       .map((item) => item.trim())
       .find((item) => item.length > 0);
     return line ? clip(line.replace(/^["「]|["」]$/g, ''), 80) : '';
-  } catch {
+  } catch (error) {
+    throwIfRunStopped(error);
     return '';
   }
 }
@@ -104,7 +131,11 @@ export async function rewriteSearchQuery(question: string, query: string, reason
  * 联网结果不切题时，把问句改成搜索引擎更容易命中的短语。
  * 失败或结果为空时返回空字符串，调用方停止重查。
  */
-export async function rewriteWebQuery(question: string, query: string, reason: string) {
+export async function rewriteWebQuery(
+  question: string,
+  query: string,
+  reason: string,
+) {
   try {
     const { text } = await tracedGenerateText({
       model: createChatModel(),
@@ -122,7 +153,8 @@ export async function rewriteWebQuery(question: string, query: string, reason: s
       .map((item) => item.trim())
       .find((item) => item.length > 0);
     return line ? clip(line.replace(/^["「]|["」]$/g, ''), 80) : '';
-  } catch {
+  } catch (error) {
+    throwIfRunStopped(error);
     return '';
   }
 }
@@ -151,7 +183,10 @@ export function citedItems(items: HybridHitView[], answer: string) {
 }
 
 /** 来源编号和回答里的 [n] 对齐。同一篇文档被两段引用时保留两条。 */
-export function citedSources(items: HybridHitView[], answer: string): ChatSource[] {
+export function citedSources(
+  items: HybridHitView[],
+  answer: string,
+): ChatSource[] {
   return citedIndexes(answer, items.length).map((index) => {
     const item = items[index - 1];
     return {

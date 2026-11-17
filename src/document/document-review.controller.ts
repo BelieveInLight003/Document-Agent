@@ -1,4 +1,16 @@
-import { Body, Controller, Get, Param, Post, Put, Query } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Get,
+  Param,
+  Post,
+  Put,
+  Query,
+  Req,
+} from '@nestjs/common';
+import type { Request } from 'express';
+import type { UserProfile } from '../user/user.service.js';
+import { documentViewer } from './document-access.js';
 import { PermissionCode } from '../permission/permission-code.js';
 import { Permissions } from '../permission/permissions.decorator.js';
 import { DocumentReviewService } from './document-review.service.js';
@@ -36,35 +48,68 @@ export class DocumentReviewController {
   /** 查询某篇文档的全部审核记录。 */
   @Permissions(PermissionCode.DOCUMENT, PermissionCode.DOCUMENT_LIST)
   @Get(':id/reviews')
-  listByDocument(@Param('id') id: string) {
-    return this.documentReviewService.listByDocument(id);
+  listByDocument(
+    @Req() request: Request & { user: UserProfile },
+    @Param('id') id: string,
+  ) {
+    return this.documentReviewService.listByDocument(
+      id,
+      documentViewer(request.user),
+    );
   }
 
-  /** 提交审核。仅草稿或已发布；已发布的会先清掉三个索引。 */
+  /** Submitting hides the current version immediately and queues index cleanup. */
   @Permissions(PermissionCode.DOCUMENT_CREATE)
   @Post(':id/review/submit')
-  submit(@Param('id') id: string, @Body() dto: SubmitReviewDto) {
-    return this.documentReviewService.submit(id, dto);
+  submit(
+    @Req() request: Request & { user: UserProfile },
+    @Param('id') id: string,
+    @Body() dto: SubmitReviewDto,
+  ) {
+    return this.documentReviewService.submit(
+      id,
+      dto,
+      documentViewer(request.user),
+    );
   }
 
   /** 驳回。参数是审核单 taskId，找到对应文档后改回草稿。审核意见必填。 */
   @Permissions(PermissionCode.DOCUMENT_REVIEW)
   @Post('reviews/:taskId/reject')
-  reject(@Param('taskId') taskId: string, @Body() dto: RejectReviewDto) {
-    return this.documentReviewService.reject(taskId, dto);
+  reject(
+    @Req() request: Request & { user: UserProfile },
+    @Param('taskId') taskId: string,
+    @Body() dto: RejectReviewDto,
+  ) {
+    return this.documentReviewService.reject(
+      taskId,
+      dto,
+      documentViewer(request.user),
+    );
   }
 
   /** 通过。参数是审核单 taskId，找到对应文档后改为已发布并重建三个索引。 */
   @Permissions(PermissionCode.DOCUMENT_REVIEW)
   @Post('reviews/:taskId/approve')
-  approve(@Param('taskId') taskId: string, @Body() dto: ApproveReviewDto) {
-    return this.documentReviewService.approve(taskId, dto);
+  approve(
+    @Req() request: Request & { user: UserProfile },
+    @Param('taskId') taskId: string,
+    @Body() dto: ApproveReviewDto,
+  ) {
+    return this.documentReviewService.approve(
+      taskId,
+      dto,
+      documentViewer(request.user),
+    );
   }
 
   /** 归档。仅已发布可以归档，并清掉三个索引，正文保留。 */
   @Permissions(PermissionCode.DOCUMENT_EDIT)
   @Put(':id/archive')
-  archive(@Param('id') id: string) {
-    return this.documentReviewService.archive(id);
+  archive(
+    @Req() request: Request & { user: UserProfile },
+    @Param('id') id: string,
+  ) {
+    return this.documentReviewService.archive(id, documentViewer(request.user));
   }
 }

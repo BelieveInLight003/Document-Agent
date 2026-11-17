@@ -1,5 +1,7 @@
 /** 文档发布后投递给下游管线的消息。 */
 export type DocumentPublishedMessage = {
+  jobId?: string;
+  action?: 'index' | 'delete';
   documentId: string;
   /** kh_document.content_id，即 MongoDB document_content 的 _id */
   contentId: string;

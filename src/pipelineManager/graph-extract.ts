@@ -43,6 +43,9 @@ function createChat() {
     apiKey,
     model: process.env.CHAT_MODEL ?? 'qwen-plus',
     temperature: 0,
+    timeout: 30_000,
+    maxRetries: 1,
+    maxTokens: 4_096,
     configuration: {
       baseURL:
         process.env.OPENAI_BASE_URL ??

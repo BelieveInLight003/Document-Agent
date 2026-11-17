@@ -24,4 +24,6 @@ export type ChatSource = {
 export type ChatMessagePayload = {
   items: HybridHitView[];
   steps: ChatStep[];
+  status?: 'completed' | 'failed' | 'aborted';
+  calls?: { model: number; tool: number };
 };

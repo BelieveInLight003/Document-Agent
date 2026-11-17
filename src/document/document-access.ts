@@ -1,5 +1,7 @@
 import { RoleCode } from '../user/role-code.js';
 import { DocumentStatus } from './document-status.js';
+import type { FindOptionsWhere } from 'typeorm';
+import type { Document } from './entities/document.entity.js';
 
 /**
  * 检索时的阅读人。userId 用字符串，避免雪花 id 被转成 Number 后丢精度。
@@ -21,8 +23,15 @@ export type DocumentAccessTarget = {
   deleted: boolean;
 };
 
-/** 从登录用户抽出检索要用的阅读人。 */
-export function documentViewer(user: { id: string; roles: string[] }): DocumentViewer {
+/**
+ * 从登录用户抽出阅读人，只保留 userId 和 roles，不查权限。
+ * 接口权限已经由 PermissionsGuard 在进控制器前查过。
+ * userId 用来认作者，roles 交给后面的 canViewDocument、canEditDocument 认管理员和审核员。
+ */
+export function documentViewer(user: {
+  id: string;
+  roles: string[];
+}): DocumentViewer {
   return { userId: user.id, roles: user.roles };
 }
 
@@ -53,21 +62,70 @@ export function toDocumentAccess(row: {
  * 3. 文档是公开的
  * 三个都不满足时，这篇文档不能进入检索结果。
  */
-export function canReadDocument(viewer: DocumentViewer, document: DocumentAccessTarget) {
+export function canReadDocument(
+  viewer: DocumentViewer,
+  document: DocumentAccessTarget,
+) {
   if (!isPublishedDocument(document)) {
     return false;
   }
-  return isPrivilegedReader(viewer) || isDocumentAuthor(viewer, document) || isPublicDocument(document);
+  return (
+    isPrivilegedReader(viewer) ||
+    isDocumentAuthor(viewer, document) ||
+    isPublicDocument(document)
+  );
+}
+
+/** Drafts and archived documents are visible only to their owner and reviewers. */
+export function canViewDocument(
+  viewer: DocumentViewer,
+  document: DocumentAccessTarget,
+) {
+  return (
+    !document.deleted &&
+    (isPrivilegedReader(viewer) ||
+      isDocumentAuthor(viewer, document) ||
+      (document.status === DocumentStatus.PUBLISHED && document.isPublic))
+  );
+}
+
+export function canEditDocument(
+  viewer: DocumentViewer,
+  document: DocumentAccessTarget,
+) {
+  return (
+    !document.deleted &&
+    (viewer.roles.includes(RoleCode.ADMIN) ||
+      isDocumentAuthor(viewer, document))
+  );
+}
+
+export function readableDocumentWhere(
+  viewer: DocumentViewer,
+): FindOptionsWhere<Document>[] {
+  const base = { status: DocumentStatus.PUBLISHED, deleted: false };
+  if (isPrivilegedReader(viewer)) return [base];
+  return [
+    { ...base, isPublic: true },
+    ...(/^\d+$/.test(viewer.userId)
+      ? [{ ...base, authorId: BigInt(viewer.userId) }]
+      : []),
+  ];
 }
 
 /** 只有未删除、状态为已发布的文档可以查询。 */
-export function isPublishedDocument(document: Pick<DocumentAccessTarget, 'status' | 'deleted'>) {
+export function isPublishedDocument(
+  document: Pick<DocumentAccessTarget, 'status' | 'deleted'>,
+) {
   return !document.deleted && document.status === DocumentStatus.PUBLISHED;
 }
 
 /** 管理员和审核员可以阅读全部已发布文档。 */
 export function isPrivilegedReader(viewer: DocumentViewer) {
-  return viewer.roles.includes(RoleCode.ADMIN) || viewer.roles.includes(RoleCode.REVIEWER);
+  return (
+    viewer.roles.includes(RoleCode.ADMIN) ||
+    viewer.roles.includes(RoleCode.REVIEWER)
+  );
 }
 
 /** 作者可以阅读自己名下的已发布文档，即使文档没有公开。 */
@@ -79,7 +137,9 @@ export function isDocumentAuthor(
 }
 
 /** 公开文档对所有登录用户可读，但仍必须已经发布。 */
-export function isPublicDocument(document: Pick<DocumentAccessTarget, 'isPublic'>) {
+export function isPublicDocument(
+  document: Pick<DocumentAccessTarget, 'isPublic'>,
+) {
   return document.isPublic;
 }
 
@@ -122,29 +182,42 @@ export function canReadDocumentId(
  */
 export function filterReadableGraph<
   TNode extends { id: string; documentId: string | null },
-  TRelation extends { source: string; target: string; documentId: string | null },
+  TRelation extends {
+    source: string;
+    target: string;
+    documentId: string | null;
+  },
 >(
   graph: { nodes: TNode[]; relations: TRelation[] },
   viewer: DocumentViewer,
   documents: ReadonlyMap<string, DocumentAccessTarget>,
 ) {
   const nodes = graph.nodes.filter(
-    (node) => !node.documentId || canReadDocumentId(node.documentId, viewer, documents),
+    (node) =>
+      !node.documentId || canReadDocumentId(node.documentId, viewer, documents),
   );
   const nodeIds = new Set(nodes.map((node) => node.id));
   const relations = graph.relations.filter((relation) => {
-    if (relation.documentId && !canReadDocumentId(relation.documentId, viewer, documents)) {
+    if (
+      relation.documentId &&
+      !canReadDocumentId(relation.documentId, viewer, documents)
+    ) {
       return false;
     }
     return nodeIds.has(relation.source) && nodeIds.has(relation.target);
   });
-  const linked = new Set(relations.flatMap((relation) => [relation.source, relation.target]));
-  const visibleNodes = nodes.filter((node) => node.documentId != null || linked.has(node.id));
+  const linked = new Set(
+    relations.flatMap((relation) => [relation.source, relation.target]),
+  );
+  const visibleNodes = nodes.filter(
+    (node) => node.documentId != null || linked.has(node.id),
+  );
   const visibleIds = new Set(visibleNodes.map((node) => node.id));
   return {
     nodes: visibleNodes,
     relations: relations.filter(
-      (relation) => visibleIds.has(relation.source) && visibleIds.has(relation.target),
+      (relation) =>
+        visibleIds.has(relation.source) && visibleIds.has(relation.target),
     ),
   };
 }

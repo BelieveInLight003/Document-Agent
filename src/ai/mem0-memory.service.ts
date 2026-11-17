@@ -2,7 +2,13 @@ import { Injectable, Logger } from '@nestjs/common';
 import { tracedGenerateText } from './langsmith.js';
 import { createChatModel } from './chat-model.js';
 import { Mem0Client } from './mem0-client.js';
-import { canRetain, parseMemoryNotes, type LongMemory, type MemoryNote } from './mem0-memory.js';
+import {
+  canRetain,
+  parseMemoryNotes,
+  type LongMemory,
+  type MemoryNote,
+} from './mem0-memory.js';
+import { runAgentOperation, throwIfRunStopped } from './agent-runtime.js';
 
 /**
  * 长期记忆的检索、分类和清理。
@@ -15,12 +21,23 @@ export class Mem0MemoryService {
   private readonly client = new Mem0Client();
 
   /** 用改写后的问题检索。永久信息和当前会话信息合并返回。 */
-  async search(userId: string, sessionId: bigint, query: string): Promise<LongMemory[]> {
+  async search(
+    userId: string,
+    sessionId: bigint,
+    query: string,
+  ): Promise<LongMemory[]> {
     if (!this.client.enabled()) return [];
     try {
-      return await this.client.search(userId, sessionId.toString(), query);
+      return await runAgentOperation(
+        () => this.client.search(userId, sessionId.toString(), query),
+        8_000,
+      );
     } catch (error) {
-      this.logger.error('检索长期记忆失败', error instanceof Error ? error.stack : String(error));
+      throwIfRunStopped();
+      this.logger.error(
+        '检索长期记忆失败',
+        error instanceof Error ? error.stack : String(error),
+      );
       return [];
     }
   }
@@ -39,19 +56,31 @@ export class Mem0MemoryService {
     if (!this.client.enabled()) return [];
     const sessionKey = sessionId.toString();
     try {
-      await this.client.extendSession(userId, sessionKey);
+      await runAgentOperation(
+        () => this.client.extendSession(userId, sessionKey),
+        8_000,
+      );
     } catch (error) {
-      this.logger.error('续期会话记忆失败', error instanceof Error ? error.stack : String(error));
+      this.logger.error(
+        '续期会话记忆失败',
+        error instanceof Error ? error.stack : String(error),
+      );
     }
     if (!canRetain(answer)) return [];
     try {
       const notes = await this.classify(question, answer);
       for (const note of notes) {
-        await this.client.add(userId, sessionKey, note);
+        await runAgentOperation(
+          () => this.client.add(userId, sessionKey, note),
+          8_000,
+        );
       }
       return notes;
     } catch (error) {
-      this.logger.error('写入长期记忆失败', error instanceof Error ? error.stack : String(error));
+      this.logger.error(
+        '写入长期记忆失败',
+        error instanceof Error ? error.stack : String(error),
+      );
       return [];
     }
   }
@@ -60,9 +89,15 @@ export class Mem0MemoryService {
   async forgetSession(userId: string, sessionId: bigint) {
     if (!this.client.enabled()) return;
     try {
-      await this.client.forgetSession(userId, sessionId.toString());
+      await runAgentOperation(
+        () => this.client.forgetSession(userId, sessionId.toString()),
+        8_000,
+      );
     } catch (error) {
-      this.logger.error('删除会话记忆失败', error instanceof Error ? error.stack : String(error));
+      this.logger.error(
+        '删除会话记忆失败',
+        error instanceof Error ? error.stack : String(error),
+      );
     }
   }
 

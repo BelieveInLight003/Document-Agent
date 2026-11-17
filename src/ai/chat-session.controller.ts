@@ -72,6 +72,12 @@ export class ChatSessionController {
     @Body() dto: AskDto,
     @Res() response: Response,
   ) {
+    const abort = new AbortController();
+    const stop = () => {
+      if (!response.writableFinished) abort.abort();
+    };
+    response.on('close', stop);
+    if (response.destroyed) abort.abort();
     try {
       const { stream, cancel } = await this.chatSessions.openStream(
         request.user.id,
@@ -79,19 +85,18 @@ export class ChatSessionController {
         dto.question,
         dto.limit,
         documentViewer(request.user),
+        abort.signal,
       );
-      const stop = () => cancel();
-      response.on('close', stop);
       try {
         await pipeUIMessageStreamToResponse({
           response,
           stream: stream as ReadableStream<UIMessageChunk>,
         });
       } finally {
-        response.off('close', stop);
+        if (response.destroyed && !response.writableFinished) cancel();
       }
     } catch (error) {
-      if (response.headersSent) return;
+      if (response.headersSent || response.destroyed) return;
       if (error instanceof HttpException) {
         const body = error.getResponse();
         response
@@ -100,6 +105,8 @@ export class ChatSessionController {
         return;
       }
       response.status(500).json({ message: '对话不可用' });
+    } finally {
+      response.off('close', stop);
     }
   }
 

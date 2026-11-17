@@ -13,12 +13,14 @@ import neo4j, {
 import { In, Repository } from 'typeorm';
 import {
   filterReadableGraph,
+  readableDocumentWhere,
   toDocumentAccess,
   type DocumentViewer,
 } from '../document/document-access.js';
 import { decodeUploadedText } from '../document/decode-uploaded-text.js';
 import { Document } from '../document/entities/document.entity.js';
 import { getNeo4jTarget } from '../pipelineManager/graph.js';
+import { runAgentOperation } from '../ai/agent-runtime.js';
 import { GraphNodeQueryDto } from './dto/graph-node-query.dto.js';
 import { GraphRelationQueryDto } from './dto/graph-relation-query.dto.js';
 import type {
@@ -48,6 +50,13 @@ WHERE (
   ))
 )
 AND ($label = '' OR $label IN labels(seed))
+AND (
+  ((seed:Document OR seed:Chunk) AND seed.documentId IN $documentIds)
+  OR (seed:Entity AND EXISTS {
+    MATCH (allowed:Document)-[:HAS_CHUNK]->(:Chunk)-[:MENTIONS]->(seed)
+    WHERE allowed.documentId IN $documentIds
+  })
+)
 WITH seed
 LIMIT $limit
 CALL {
@@ -59,7 +68,7 @@ CALL {
     OPTIONAL MATCH (seed)-[hasChunk:HAS_CHUNK]->(chunk:Chunk)
     OPTIONAL MATCH (chunk)-[mentions:MENTIONS]->(entity:Entity)
     OPTIONAL MATCH (entity)-[related:RELATED]-(other:Entity)
-    WHERE related.documentId = seed.documentId
+WHERE related.documentId = seed.documentId AND related.chunkId = chunk.chunkId
     RETURN seed AS n1, hasChunk AS r1, chunk AS n2, mentions AS r2, entity AS n3, related AS r3, other AS n4
     UNION
     WITH seed
@@ -68,16 +77,16 @@ CALL {
     OPTIONAL MATCH (document:Document)-[hasChunk:HAS_CHUNK]->(seed)
     OPTIONAL MATCH (seed)-[mentions:MENTIONS]->(entity:Entity)
     OPTIONAL MATCH (entity)-[related:RELATED]-(other:Entity)
-    WHERE related.documentId = document.documentId OR related.chunkId = seed.chunkId
+WHERE related.documentId = document.documentId AND related.chunkId = seed.chunkId
     RETURN document AS n1, hasChunk AS r1, seed AS n2, mentions AS r2, entity AS n3, related AS r3, other AS n4
     UNION
     WITH seed
     WITH seed
     WHERE seed:Entity
-    OPTIONAL MATCH (chunk:Chunk)-[mentions:MENTIONS]->(seed)
-    OPTIONAL MATCH (document:Document)-[hasChunk:HAS_CHUNK]->(chunk)
+    MATCH (document:Document)-[hasChunk:HAS_CHUNK]->(chunk:Chunk)-[mentions:MENTIONS]->(seed)
+    WHERE document.documentId IN $documentIds
     OPTIONAL MATCH (seed)-[related:RELATED]-(other:Entity)
-    WHERE related.documentId = document.documentId OR document IS NULL
+    WHERE related.documentId = document.documentId AND related.chunkId = chunk.chunkId
     RETURN document AS n1, hasChunk AS r1, chunk AS n2, mentions AS r2, seed AS n3, related AS r3, other AS n4
   }
   RETURN n1, r1, n2, r2, n3, r3, n4
@@ -89,6 +98,7 @@ RETURN n1, r1, n2, r2, n3, r3, n4
 const RELATION_CYPHER = `
 MATCH (source)-[relation]->(target)
 WHERE ($relation = '' OR type(relation) = $relation)
+AND coalesce(relation.documentId, source.documentId, target.documentId) IN $documentIds
 AND (
   toLower(type(relation)) CONTAINS toLower($keyword)
   OR toLower(coalesce(relation.type, '')) CONTAINS toLower($keyword)
@@ -122,22 +132,38 @@ export class GraphService {
   ) {}
 
   /** 命中节点后展开到所属文档、切片、实体和它们之间的关系，再按文档权限裁剪。 */
-  async searchNodes(viewer: DocumentViewer, query: GraphNodeQueryDto): Promise<GraphView> {
+  async searchNodes(
+    viewer: DocumentViewer,
+    query: GraphNodeQueryDto,
+  ): Promise<GraphView> {
     const keyword = requiredKeyword(query.keyword);
+    const documentIds = await this.readableIds(viewer);
+    if (documentIds.length === 0) return { nodes: [], relations: [] };
     const result = await this.run(NODE_CYPHER, {
+      documentIds,
       keyword,
       label: query.label ?? '',
       limit: neo4j.int(query.limit ?? DEFAULT_LIMIT),
       expansion: neo4j.int(EXPANSION_LIMIT),
     });
-    const graph = readGraph(result, ['n1', 'n2', 'n3', 'n4'], ['r1', 'r2', 'r3']);
+    const graph = readGraph(
+      result,
+      ['n1', 'n2', 'n3', 'n4'],
+      ['r1', 'r2', 'r3'],
+    );
     return this.applyDocumentAccess(viewer, graph);
   }
 
   /** 命中关系后补上两端节点，以及这条关系所属的文档和切片，再按文档权限裁剪。 */
-  async searchRelations(viewer: DocumentViewer, query: GraphRelationQueryDto): Promise<GraphView> {
+  async searchRelations(
+    viewer: DocumentViewer,
+    query: GraphRelationQueryDto,
+  ): Promise<GraphView> {
     const keyword = requiredKeyword(query.keyword);
+    const documentIds = await this.readableIds(viewer);
+    if (documentIds.length === 0) return { nodes: [], relations: [] };
     const result = await this.run(RELATION_CYPHER, {
+      documentIds,
       keyword,
       relation: query.relation ?? '',
       limit: neo4j.int(query.limit ?? DEFAULT_LIMIT),
@@ -158,7 +184,17 @@ export class GraphService {
 
     const session = target.driver.session({ database: target.database });
     try {
-      return await session.run(cypher, params);
+      return await runAgentOperation(async (signal) => {
+        const cancel = () => {
+          void session.close().catch(() => undefined);
+        };
+        signal.addEventListener('abort', cancel, { once: true });
+        try {
+          return await session.run(cypher, params, { timeout: 15_000 });
+        } finally {
+          signal.removeEventListener('abort', cancel);
+        }
+      });
     } catch (error) {
       this.logger.error(
         '图谱检索失败',
@@ -170,11 +206,22 @@ export class GraphService {
     }
   }
 
+  private async readableIds(viewer: DocumentViewer) {
+    const rows = await this.documentRepository.find({
+      where: readableDocumentWhere(viewer),
+      select: { id: true },
+    });
+    return rows.map((row) => row.id.toString());
+  }
+
   /**
    * 先按文档阅读权限去掉不能看的节点和边，再用 Postgres 标题覆盖剩下的文档节点。
    * 库里没有对应文档时，这张图上的相关节点也不会留下。
    */
-  private async applyDocumentAccess(viewer: DocumentViewer, graph: GraphView): Promise<GraphView> {
+  private async applyDocumentAccess(
+    viewer: DocumentViewer,
+    graph: GraphView,
+  ): Promise<GraphView> {
     const ids = graphDocumentIds(graph);
     const rows =
       ids.length === 0
@@ -182,8 +229,26 @@ export class GraphService {
         : await this.documentRepository.find({
             where: { id: In(ids.map((id) => BigInt(id))), deleted: false },
           });
-    const documents = new Map(rows.map((row) => [row.id.toString(), toDocumentAccess(row)]));
-    const visible = filterReadableGraph(graph, viewer, documents);
+    const documents = new Map(
+      rows.map((row) => [row.id.toString(), toDocumentAccess(row)]),
+    );
+    const versions = new Map(
+      rows.map((row) => [row.id.toString(), row.contentId]),
+    );
+    const currentIds = new Set(
+      graph.nodes
+        .filter(
+          (node) =>
+            node.label === 'Document' &&
+            node.documentId &&
+            node.contentId === versions.get(node.documentId),
+        )
+        .map((node) => node.documentId),
+    );
+    const currentDocuments = new Map(
+      [...documents].filter(([id]) => currentIds.has(id)),
+    );
+    const visible = filterReadableGraph(graph, viewer, currentDocuments);
     const byId = new Map(rows.map((row) => [row.id.toString(), row]));
     return {
       relations: visible.relations,
@@ -209,7 +274,10 @@ function graphDocumentIds(graph: GraphView) {
 }
 
 /** 文档节点用 Postgres 里的正文 id 和标题覆盖，保证和资料库一致。 */
-function overlayDocumentNode(node: GraphNodeView, documents: Map<string, Document>) {
+function overlayDocumentNode(
+  node: GraphNodeView,
+  documents: Map<string, Document>,
+) {
   if (node.label !== 'Document' || !node.documentId) {
     return node;
   }
@@ -286,7 +354,10 @@ class GraphBuilder {
       this.pending.push(relation);
       return;
     }
-    this.relations.set(relation.elementId, toRelationView(relation, source, target));
+    this.relations.set(
+      relation.elementId,
+      toRelationView(relation, source, target),
+    );
   }
 
   finish(): GraphView {
@@ -343,7 +414,8 @@ function toNodeView(node: Node): GraphNodeView {
     node.labels[0] ??
     'Node';
   const title = readable(text(properties.title));
-  const entityType = label === 'Entity' ? readable(text(properties.type)) : null;
+  const entityType =
+    label === 'Entity' ? readable(text(properties.type)) : null;
   const name =
     readable(text(properties.name)) ??
     title ??
@@ -364,6 +436,7 @@ function toNodeView(node: Node): GraphNodeView {
       label === 'Chunk' && content
         ? readable(content.slice(0, PREVIEW_LENGTH))
         : null,
+    content: label === 'Chunk' ? readable(content) : null,
     document: null,
   };
 }

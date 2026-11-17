@@ -6,6 +6,7 @@ import {
 } from '../document/schema/document.content.schema.js';
 import { MqModule } from '../mq/mq.module.js';
 import { PipelineManagerService } from './pipeline-manager.service.js';
+import { PipelineManagerController } from './pipeline-manager.controller.js';
 
 /**
  * 文档发布后的业务处理。
@@ -19,6 +20,7 @@ import { PipelineManagerService } from './pipeline-manager.service.js';
     ]),
   ],
   providers: [PipelineManagerService],
+  controllers: [PipelineManagerController],
   exports: [PipelineManagerService],
 })
 export class PipelineManagerModule {}

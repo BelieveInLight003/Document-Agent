@@ -37,14 +37,21 @@ export class MqService {
     );
   }
 
+  /**
+   * 登记切片向量队列的处理函数。这里还不取消息，只告诉消费者：
+   * knowledge_hub.document.published 里来消息时调用 handler。
+   * 真正开始消费要等应用启动完成。
+   */
   subscribe<T>(handler: MessageHandler<T>) {
     this.consumer.register(getRabbitmqConfig().queues.published, handler);
   }
 
+  /** 登记全文索引队列的处理函数。消息来自 knowledge_hub.document.keyword。 */
   subscribeKeyword<T>(handler: MessageHandler<T>) {
     this.consumer.register(getRabbitmqConfig().queues.keyword, handler);
   }
 
+  /** 登记图谱队列的处理函数。消息来自 knowledge_hub.document.graph。 */
   subscribeGraph<T>(handler: MessageHandler<T>) {
     this.consumer.register(getRabbitmqConfig().queues.graph, handler);
   }

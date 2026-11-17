@@ -22,6 +22,7 @@ export type GraphNodeView = {
   title: string | null;
   index: number | null;
   contentPreview: string | null;
+  content?: string | null;
   document: GraphDocumentBrief | null;
 };
 

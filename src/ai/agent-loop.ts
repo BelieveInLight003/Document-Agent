@@ -1,8 +1,24 @@
 import type { HybridHitView } from './ai.view.js';
 import type { ChatStep } from './chat-step.js';
 import type { ChatTrace } from './langsmith.js';
-import { GRADE_LABEL, gradeHits, rewriteSearchQuery, rewriteWebQuery, webSearchDisabledReason, webSearchEnabled } from './agent-grade.js';
-import { INTENT_LABEL, routeQuestion, type AgentIntent } from './agent-route.js';
+import {
+  GRADE_LABEL,
+  gradeHits,
+  rewriteSearchQuery,
+  rewriteWebQuery,
+  webSearchDisabledReason,
+  webSearchEnabled,
+} from './agent-grade.js';
+import {
+  INTENT_LABEL,
+  routeQuestion,
+  type AgentIntent,
+} from './agent-route.js';
+import {
+  AgentBudgetError,
+  AgentRuntime,
+  currentRuntime,
+} from './agent-runtime.js';
 
 /**
  * 知识库问答的固定决策链。
@@ -16,21 +32,66 @@ import { INTENT_LABEL, routeQuestion, type AgentIntent } from './agent-route.js'
  * 公司制度已经能由文档或图谱回答时，不再联网。
  */
 
-export type AgentOutcome = 'answer' | 'chat' | 'preference' | 'refuse' | 'unavailable' | 'aborted';
+export type AgentOutcome =
+  | 'answer'
+  | 'chat'
+  | 'preference'
+  | 'refuse'
+  | 'unavailable'
+  | 'aborted';
 
 export type AgentLoopResult = {
   intent: AgentIntent;
   query: string;
-  /** 只有评估为切题且够用的那一轮资料。不够时是空数组。 */
+  /** Accumulated evidence that passed the final sufficiency check. */
   items: HybridHitView[];
   outcome: AgentOutcome;
   /** 拒答原因。回答时不使用。 */
-  refuseReason?: 'knowledge' | 'web-insufficient' | 'web-unavailable' | 'web-off';
+  refuseReason?:
+    | 'knowledge'
+    | 'web-insufficient'
+    | 'web-unavailable'
+    | 'web-off';
 };
 
-const TOOL_BUDGET = 3;
+type AgentLoopInput = Parameters<typeof runAgentLoopInternal>[0];
 
-export async function runAgentLoop(input: {
+export async function runAgentLoop(
+  input: AgentLoopInput,
+): Promise<AgentLoopResult> {
+  const runtime = currentRuntime() ?? new AgentRuntime(input.signal);
+  try {
+    return await runtime.run(() =>
+      runAgentLoopInternal({ ...input, signal: runtime.signal }),
+    );
+  } catch (error) {
+    if (
+      runtime.signal.aborted ||
+      (error instanceof Error && error.name === 'AbortError')
+    ) {
+      return {
+        intent: 'knowledge',
+        query: input.question,
+        items: [],
+        outcome: 'aborted',
+      };
+    }
+    if (
+      error instanceof AgentBudgetError ||
+      (error instanceof Error && error.name === 'TimeoutError')
+    ) {
+      return {
+        intent: 'knowledge',
+        query: input.question,
+        items: [],
+        outcome: 'unavailable',
+      };
+    }
+    throw error;
+  }
+}
+
+async function runAgentLoopInternal(input: {
   question: string;
   memory: string;
   longTerm: string;
@@ -59,31 +120,67 @@ export async function runAgentLoop(input: {
     status: 'done',
   });
   if (input.signal.aborted) {
-    return { intent: route.intent, query: route.query, items: [], outcome: 'aborted' };
+    return {
+      intent: route.intent,
+      query: route.query,
+      items: [],
+      outcome: 'aborted',
+    };
   }
   if (route.intent === 'chat' || route.intent === 'preference') {
-    return { intent: route.intent, query: route.query, items: [], outcome: route.intent };
+    return {
+      intent: route.intent,
+      query: route.query,
+      items: [],
+      outcome: route.intent,
+    };
   }
   if (route.intent === 'web') {
     return searchWeb(input, route.intent);
   }
 
-  let calls = 0;
   const first = await searchRound(input, route.query, 'search', 'graph');
   if (first.outcome) {
-    return { intent: route.intent, query: route.query, items: [], outcome: first.outcome };
+    return {
+      intent: route.intent,
+      query: route.query,
+      items: [],
+      outcome: first.outcome,
+    };
   }
-  calls += 1;
-  const graded = await grade(input, input.question, route.query, first.items, 'grade');
+  const graded = await grade(
+    input,
+    input.question,
+    route.query,
+    first.items,
+    'grade',
+  );
+  if (graded.grade === 'unavailable')
+    return {
+      intent: route.intent,
+      query: route.query,
+      items: [],
+      outcome: 'unavailable',
+    };
   if (graded.grade === 'sufficient') {
-    return { intent: route.intent, query: route.query, items: first.items, outcome: 'answer' };
+    return {
+      intent: route.intent,
+      query: route.query,
+      items: first.items,
+      outcome: 'answer',
+    };
   }
   // 第一次没有资料：开关打开就联网，不再改写。
   if (first.items.length === 0 && shouldSearchWeb(route.intent)) {
     return searchWeb(input, route.intent);
   }
-  if (calls >= TOOL_BUDGET || input.signal.aborted) {
-    return { intent: route.intent, query: route.query, items: [], outcome: input.signal.aborted ? 'aborted' : 'refuse' };
+  if (input.signal.aborted) {
+    return {
+      intent: route.intent,
+      query: route.query,
+      items: [],
+      outcome: input.signal.aborted ? 'aborted' : 'refuse',
+    };
   }
 
   const rewritten = await input.trace.span(
@@ -93,7 +190,6 @@ export async function runAgentLoop(input: {
     () => rewriteSearchQuery(input.question, route.query, graded.reason),
     (query) => ({ query }),
   );
-  calls += 1;
   if (!rewritten || rewritten === route.query) {
     input.onStep({
       id: 'rewrite',
@@ -102,7 +198,7 @@ export async function runAgentLoop(input: {
       detail: graded.reason,
       status: 'done',
     });
-    return whenKnowledgeShort(input, route.intent, route.query);
+    return whenKnowledgeShort(input, route.intent, route.query, first.items);
   }
   input.onStep({
     id: 'rewrite',
@@ -111,19 +207,48 @@ export async function runAgentLoop(input: {
     detail: `改为：${rewritten}`,
     status: 'done',
   });
-  if (calls >= TOOL_BUDGET || input.signal.aborted) {
-    return { intent: route.intent, query: rewritten, items: [], outcome: input.signal.aborted ? 'aborted' : 'refuse' };
+  if (input.signal.aborted) {
+    return {
+      intent: route.intent,
+      query: rewritten,
+      items: [],
+      outcome: input.signal.aborted ? 'aborted' : 'refuse',
+    };
   }
 
   const second = await searchRound(input, rewritten, 'search-2', 'graph-2');
   if (second.outcome) {
-    return { intent: route.intent, query: rewritten, items: [], outcome: second.outcome };
+    return {
+      intent: route.intent,
+      query: rewritten,
+      items: [],
+      outcome: second.outcome,
+    };
   }
-  const gradedAgain = await grade(input, input.question, rewritten, second.items, 'grade-2');
+  const evidence = mergeEvidence(first.items, second.items);
+  const gradedAgain = await grade(
+    input,
+    input.question,
+    rewritten,
+    evidence,
+    'grade-2',
+  );
+  if (gradedAgain.grade === 'unavailable')
+    return {
+      intent: route.intent,
+      query: rewritten,
+      items: [],
+      outcome: 'unavailable',
+    };
   if (gradedAgain.grade === 'sufficient') {
-    return { intent: route.intent, query: rewritten, items: second.items, outcome: 'answer' };
+    return {
+      intent: route.intent,
+      query: rewritten,
+      items: evidence,
+      outcome: 'answer',
+    };
   }
-  return whenKnowledgeShort(input, route.intent, rewritten);
+  return whenKnowledgeShort(input, route.intent, rewritten, evidence);
 }
 
 function whenKnowledgeShort(
@@ -137,9 +262,16 @@ function whenKnowledgeShort(
   },
   intent: AgentIntent,
   query: string,
+  evidence: HybridHitView[] = [],
 ) {
-  if (shouldSearchWeb(intent)) return searchWeb(input, intent);
-  return { intent, query, items: [], outcome: 'refuse' as const, refuseReason: 'knowledge' as const };
+  if (shouldSearchWeb(intent)) return searchWeb({ ...input, evidence }, intent);
+  return {
+    intent,
+    query,
+    items: [],
+    outcome: 'refuse' as const,
+    refuseReason: 'knowledge' as const,
+  };
 }
 
 /** 开关打开时，知识库不够也联网。知识库不足再联网即使关着也会走到联网步骤并说明原因。 */
@@ -156,6 +288,7 @@ async function searchWeb(
     trace: ChatTrace;
     retrieveWeb: (query: string, limit: number) => Promise<HybridHitView[]>;
     onStep: (step: ChatStep) => void;
+    evidence?: HybridHitView[];
   },
   intent: AgentIntent,
 ): Promise<AgentLoopResult> {
@@ -168,9 +301,16 @@ async function searchWeb(
       detail: webSearchDisabledReason(),
       status: 'done',
     });
-    return { intent, query, items: [], outcome: 'refuse', refuseReason: 'web-off' };
+    return {
+      intent,
+      query,
+      items: [],
+      outcome: 'refuse',
+      refuseReason: 'web-off',
+    };
   }
-  if (input.signal.aborted) return { intent, query, items: [], outcome: 'aborted' };
+  if (input.signal.aborted)
+    return { intent, query, items: [], outcome: 'aborted' };
   input.onStep({
     id: 'web',
     kind: 'action',
@@ -181,7 +321,8 @@ async function searchWeb(
   try {
     items = await input.retrieveWeb(query, input.limit);
   } catch {
-    if (input.signal.aborted) return { intent, query, items: [], outcome: 'aborted' };
+    if (input.signal.aborted)
+      return { intent, query, items: [], outcome: 'aborted' };
     input.onStep({
       id: 'web',
       kind: 'action',
@@ -189,7 +330,13 @@ async function searchWeb(
       detail: '联网暂时不可用。',
       status: 'done',
     });
-    return { intent, query, items: [], outcome: 'refuse', refuseReason: 'web-unavailable' };
+    return {
+      intent,
+      query,
+      items: [],
+      outcome: 'refuse',
+      refuseReason: 'web-unavailable',
+    };
   }
   input.onStep({
     id: 'web',
@@ -198,19 +345,32 @@ async function searchWeb(
     detail: `检索到 ${items.length} 条。`,
     status: 'done',
   });
-  if (input.signal.aborted) return { intent, query, items: [], outcome: 'aborted' };
-  const graded = await grade(input, input.question, query, items, 'web-grade');
+  if (input.signal.aborted)
+    return { intent, query, items: [], outcome: 'aborted' };
+  const evidence = mergeEvidence(input.evidence ?? [], items);
+  const graded = await grade(
+    input,
+    input.question,
+    query,
+    evidence,
+    'web-grade',
+  );
+  if (graded.grade === 'unavailable')
+    return { intent, query, items: [], outcome: 'unavailable' };
   if (graded.grade === 'sufficient') {
-    return { intent, query, items, outcome: 'answer' };
+    return { intent, query, items: evidence, outcome: 'answer' };
   }
-  if (input.signal.aborted) return { intent, query, items: [], outcome: 'aborted' };
+  if (input.signal.aborted)
+    return { intent, query, items: [], outcome: 'aborted' };
 
   const titles = items
     .slice(0, 4)
     .map((item) => item.title)
     .filter((title) => title.length > 0)
     .join('、');
-  const reason = titles ? `${graded.reason}。已检索到：${titles}` : graded.reason;
+  const reason = titles
+    ? `${graded.reason}。已检索到：${titles}`
+    : graded.reason;
   const rewritten = await input.trace.span(
     '检索改写',
     'chain',
@@ -226,7 +386,13 @@ async function searchWeb(
       detail: graded.reason,
       status: 'done',
     });
-    return { intent, query, items: [], outcome: 'refuse', refuseReason: 'web-insufficient' };
+    return {
+      intent,
+      query,
+      items: [],
+      outcome: 'refuse',
+      refuseReason: 'web-insufficient',
+    };
   }
   input.onStep({
     id: 'web-rewrite',
@@ -235,17 +401,39 @@ async function searchWeb(
     detail: graded.reason,
     status: 'done',
   });
-  if (input.signal.aborted) return { intent, query: rewritten, items: [], outcome: 'aborted' };
+  if (input.signal.aborted)
+    return { intent, query: rewritten, items: [], outcome: 'aborted' };
 
   const again = await fetchWeb(input, rewritten, 'web-2');
   if (again.outcome) {
-    return { intent, query: rewritten, items: [], outcome: again.outcome === 'aborted' ? 'aborted' : 'refuse', refuseReason: again.outcome === 'aborted' ? undefined : 'web-unavailable' };
+    return {
+      intent,
+      query: rewritten,
+      items: [],
+      outcome: again.outcome === 'aborted' ? 'aborted' : 'refuse',
+      refuseReason: again.outcome === 'aborted' ? undefined : 'web-unavailable',
+    };
   }
-  const gradedAgain = await grade(input, input.question, rewritten, again.items, 'web-grade-2');
+  const combined = mergeEvidence(evidence, again.items);
+  const gradedAgain = await grade(
+    input,
+    input.question,
+    rewritten,
+    combined,
+    'web-grade-2',
+  );
+  if (gradedAgain.grade === 'unavailable')
+    return { intent, query: rewritten, items: [], outcome: 'unavailable' };
   if (gradedAgain.grade === 'sufficient') {
-    return { intent, query: rewritten, items: again.items, outcome: 'answer' };
+    return { intent, query: rewritten, items: combined, outcome: 'answer' };
   }
-  return { intent, query: rewritten, items: [], outcome: 'refuse', refuseReason: 'web-insufficient' };
+  return {
+    intent,
+    query: rewritten,
+    items: [],
+    outcome: 'refuse',
+    refuseReason: 'web-insufficient',
+  };
 }
 
 async function fetchWeb(
@@ -263,12 +451,24 @@ async function fetchWeb(
   input.onStep({ id: stepId, kind: 'action', title, status: 'running' });
   try {
     const items = await input.retrieveWeb(query, input.limit);
-    input.onStep({ id: stepId, kind: 'action', title, detail: `检索到 ${items.length} 条。`, status: 'done' });
+    input.onStep({
+      id: stepId,
+      kind: 'action',
+      title,
+      detail: `检索到 ${items.length} 条。`,
+      status: 'done',
+    });
     if (input.signal.aborted) return { items: [], outcome: 'aborted' };
     return { items };
   } catch {
     if (input.signal.aborted) return { items: [], outcome: 'aborted' };
-    input.onStep({ id: stepId, kind: 'action', title, detail: '联网暂时不可用。', status: 'done' });
+    input.onStep({
+      id: stepId,
+      kind: 'action',
+      title,
+      detail: '联网暂时不可用。',
+      status: 'done',
+    });
     return { items: [], outcome: 'unavailable' };
   }
 }
@@ -312,18 +512,27 @@ async function searchRound(
     id: docStepId,
     kind: 'action',
     title: `我将在知识库中检索「${query}」。`,
-    detail: docs.failed ? '知识库暂时不可用。' : `检索到 ${docs.items.length} 条。`,
+    detail: docs.failed
+      ? '知识库暂时不可用。'
+      : `检索到 ${docs.items.length} 条。`,
     status: 'done',
   });
   input.onStep({
     id: graphStepId,
     kind: 'action',
     title: `我将在知识图谱中检索「${query}」。`,
-    detail: graph.failed ? '图谱暂时不可用。' : `检索到 ${graph.items.length} 条。`,
+    detail: graph.failed
+      ? '图谱暂时不可用。'
+      : `检索到 ${graph.items.length} 条。`,
     status: 'done',
   });
   if (input.signal.aborted) return { items: [], outcome: 'aborted' };
-  if (docs.failed && graph.failed) return { items: [], outcome: 'unavailable' };
+  if (
+    (docs.failed || graph.failed) &&
+    docs.items.length + graph.items.length === 0
+  ) {
+    return { items: [], outcome: 'unavailable' };
+  }
   return { items: [...docs.items, ...graph.items] };
 }
 
@@ -332,6 +541,15 @@ function readSearch(task: Promise<HybridHitView[]>) {
     (items) => ({ items, failed: false }),
     () => ({ items: [] as HybridHitView[], failed: true }),
   );
+}
+
+export function mergeEvidence(...rounds: HybridHitView[][]) {
+  const items = new Map<string, HybridHitView>();
+  for (const item of rounds.flat()) {
+    const key = `${item.documentId}:${item.contentId}:${item.chunkId}:${item.content}`;
+    if (!items.has(key)) items.set(key, item);
+  }
+  return [...items.values()];
 }
 
 async function grade(

@@ -37,7 +37,10 @@ function getClient(node: string) {
 }
 
 /** 切片向量索引。混合检索和写入共用同一个客户端。未启用时返回 null。 */
-export function getChunkIndexTarget(): { client: Client; index: string } | null {
+export function getChunkIndexTarget(): {
+  client: Client;
+  index: string;
+} | null {
   const config = getElasticsearchConfig();
   if (!config.enabled) {
     return null;
@@ -95,7 +98,7 @@ async function ensureIndex(es: Client, config: ElasticsearchConfig) {
   });
 }
 
-/** 将向量化后的 chunks 写入 Elasticsearch。同一文档先删旧数据再写入。 */
+/** Write stable chunk IDs first, then remove superseded evidence after success. */
 export async function indexEmbeddedChunks(input: {
   documentId: string;
   contentId: string;
@@ -109,12 +112,6 @@ export async function indexEmbeddedChunks(input: {
 
   const es = getClient(config.node);
   await ensureIndex(es, config);
-  await es.deleteByQuery({
-    index: config.index,
-    query: { term: { documentId: input.documentId } },
-    refresh: true,
-    conflicts: 'proceed',
-  });
   if (input.chunks.length === 0) {
     return;
   }
@@ -136,6 +133,19 @@ export async function indexEmbeddedChunks(input: {
     const failed = result.items.find((item) => item.index?.error);
     throw new Error(failed?.index?.error?.reason ?? 'Elasticsearch 写入失败');
   }
+  await es.deleteByQuery({
+    index: config.index,
+    query: {
+      bool: {
+        filter: [{ term: { documentId: input.documentId } }],
+        must_not: [
+          { terms: { chunkId: input.chunks.map((chunk) => chunk.id) } },
+        ],
+      },
+    },
+    refresh: true,
+    conflicts: 'proceed',
+  });
 }
 
 /** 删除一篇文档在索引里的全部分段。索引不存在时直接返回。 */

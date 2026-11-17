@@ -11,6 +11,7 @@ export type DocumentChunk = {
 export async function splitToChunks(
   title: string,
   content: string,
+  version?: string,
 ): Promise<DocumentChunk[]> {
   const splitter = RecursiveCharacterTextSplitter.fromLanguage('markdown', {
     chunkSize: chunkSize(),
@@ -19,8 +20,8 @@ export async function splitToChunks(
   const pieces = (await splitter.splitText(content))
     .map((piece) => piece.trim())
     .filter(Boolean);
-  return pieces.map((piece) => ({
-    id: snowflake.generate(),
+  return pieces.map((piece, index) => ({
+    id: version ? `${version}:${index}` : snowflake.generate(),
     title,
     content: piece,
   }));
